@@ -1,6 +1,7 @@
 import re
 import datetime
 import os
+import json
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -10,7 +11,18 @@ from googleapiclient.discovery import build
 
 # ===== GOOGLE CALENDAR =====
 def get_service():
-    creds = Credentials.from_authorized_user_file('token.json')
+    token_json = os.getenv("GOOGLE_TOKEN")
+
+    if not token_json:
+        raise ValueError("GOOGLE_TOKEN não encontrado nas variáveis de ambiente.")
+
+    try:
+        creds_dict = json.loads(token_json)
+    except Exception:
+        raise ValueError("GOOGLE_TOKEN inválido (JSON mal formatado).")
+
+    creds = Credentials.from_authorized_user_info(creds_dict)
+
     return build('calendar', 'v3', credentials=creds)
 
 service = get_service()
@@ -66,7 +78,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_message(text)
 
     if not parsed:
-        await update.message.reply_text("Use: Dia X de mês (ex: Dia 12 de dezembro comprar fone)")
+        await update.message.reply_text(
+            "Use: Dia X de mês (ex: Dia 12 de dezembro comprar fone)"
+        )
         return
 
     titulo, data = parsed
@@ -77,7 +91,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Evento criado: {titulo} em {data.strftime('%d/%m %H:%M')}"
     )
 
-# ===== TOKEN =====
+# ===== TOKEN TELEGRAM =====
 raw_token = os.getenv("TELEGRAM_TOKEN")
 print("DEBUG TOKEN RAW:", repr(raw_token))
 
