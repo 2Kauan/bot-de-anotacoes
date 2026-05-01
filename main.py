@@ -5,13 +5,11 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import google.generativeai as genai  # Alterado para o SDK estável
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==========================================
 # 1. CONFIGURAÇÕES GERAIS
@@ -20,8 +18,9 @@ load_dotenv()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 
-# Inicialização padrão (deixa o SDK gerenciar a versão estável)
-ia_client = genai.Client(api_key=GEMINI_KEY)
+# Configuração do SDK Estável
+genai.configure(api_key=GEMINI_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # ==========================================
 # 2. INTEGRAÇÃO GOOGLE CALENDAR
@@ -41,7 +40,7 @@ def _sync_list_events():
     service = get_calendar_service()
     if not service: return []
     now = datetime.datetime.utcnow().isoformat() + 'Z'
-    return service.events().list(calendarId='primary', timeMin=now, maxResults=20, singleEvents=True, orderBy='startTime').execute().get('items', [])
+    return service.events().list(calendarId='primary', timeMin=now, maxResults=15, singleEvents=True, orderBy='startTime').execute().get('items', [])
 
 def _sync_create_event(titulo, data_iso):
     service = get_calendar_service()
@@ -66,7 +65,7 @@ async def calendar_action(action, **kwargs):
     elif action == "delete": return await asyncio.to_thread(_sync_delete_event, kwargs.get("id"))
 
 # ==========================================
-# 3. MOTOR DE INTELIGÊNCIA (GEMINI 1.5 FLASH)
+# 3. MOTOR DE INTELIGÊNCIA
 # ==========================================
 async def process_intent_with_ai(prompt_text, current_events):
     agora = datetime.datetime.now()
@@ -85,16 +84,14 @@ async def process_intent_with_ai(prompt_text, current_events):
     Retorne JSON: {{"acao": "create"|"read"|"update"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
     """
     
-    # Alterado para o nome de modelo canônico que evita o 404
+    # Chamada usando o SDK clássico e estável
     response = await asyncio.to_thread(
-        ia_client.models.generate_content, 
-        model='models/gemini-1.5-flash', 
-        contents=prompt
+        model.generate_content,
+        prompt,
+        generation_config={"response_mime_type": "application/json"}
     )
     
-    res_text = response.text.strip()
-    if "```json" in res_text: res_text = res_text.split("```json")[1].split("```")[0].strip()
-    return json.loads(res_text)
+    return json.loads(response.text)
 
 # ==========================================
 # 4. CONTROLLER TELEGRAM
@@ -131,6 +128,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
+    print("🚀 API Online na Railway (SDK Estável).")
     yield
     await bot_app.stop()
     await bot_app.shutdown()
@@ -140,7 +138,6 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    print("--- MENSAGEM RECEBIDA ---")
     update = Update.de_json(data, bot_app.bot)
     asyncio.create_task(bot_app.process_update(update))
     return {"status": "ok"}
