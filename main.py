@@ -19,11 +19,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 load_dotenv()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Inicialização estável
-ia_client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1'})
-lembretes_enviados = set()
+# Inicialização padrão (deixa o SDK gerenciar a versão estável)
+ia_client = genai.Client(api_key=GEMINI_KEY)
 
 # ==========================================
 # 2. INTEGRAÇÃO GOOGLE CALENDAR
@@ -31,23 +29,19 @@ lembretes_enviados = set()
 def get_calendar_service():
     token_json = os.getenv("GOOGLE_TOKEN")
     try:
-        if not token_json:
-            print("ERRO: GOOGLE_TOKEN não configurado nas variáveis da Railway.")
-            return None
+        if not token_json: return None
         creds_dict = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(creds_dict)
         return build('calendar', 'v3', credentials=creds)
     except Exception as e:
-        print(f"ERRO CRÍTICO NO GOOGLE_TOKEN: {e}")
+        print(f"Erro no Token Google: {e}")
         return None
 
-def _sync_list_events(max_days_ahead=30):
+def _sync_list_events():
     service = get_calendar_service()
     if not service: return []
-    now = datetime.datetime.utcnow()
-    time_max = (now + datetime.timedelta(days=max_days_ahead)).isoformat() + 'Z'
-    now_iso = now.isoformat() + 'Z'
-    return service.events().list(calendarId='primary', timeMin=now_iso, timeMax=time_max, maxResults=50, singleEvents=True, orderBy='startTime').execute().get('items', [])
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    return service.events().list(calendarId='primary', timeMin=now, maxResults=20, singleEvents=True, orderBy='startTime').execute().get('items', [])
 
 def _sync_create_event(titulo, data_iso):
     service = get_calendar_service()
@@ -74,65 +68,44 @@ async def calendar_action(action, **kwargs):
 # ==========================================
 # 3. MOTOR DE INTELIGÊNCIA (GEMINI 1.5 FLASH)
 # ==========================================
-async def process_intent_with_ai(prompt_text, current_events, audio_path=None):
+async def process_intent_with_ai(prompt_text, current_events):
     agora = datetime.datetime.now()
     limite_48h = agora + datetime.timedelta(hours=48)
     
-    eventos_simplificados = [
-        {"id": e['id'], "titulo": e.get('summary'), "inicio": e['start'].get('dateTime')} 
-        for e in current_events
-    ]
+    eventos_simplificados = [{"id": e['id'], "titulo": e.get('summary'), "inicio": e['start'].get('dateTime')} for e in current_events]
     
     prompt = f"""
     Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}.
-    Agenda Atual: {json.dumps(eventos_simplificados, ensure_ascii=False)}
+    Agenda: {json.dumps(eventos_simplificados, ensure_ascii=False)}
     
-    INSTRUÇÃO DE SEGURANÇA: Se o usuário pedir para apagar ou alterar eventos, você só pode incluir no campo 'event_ids' os IDs de eventos que começam ANTES de {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}. Para eventos após esse horário, informe ao usuário que você não tem permissão para remover.
+    REGRA: IDs de eventos após {limite_48h.strftime("%Y-%m-%d %H:%M:%S")} NÃO podem ser deletados.
 
-    Mensagem do usuário: "{prompt_text}"
+    Mensagem: "{prompt_text}"
     
-    Retorne estritamente um JSON no formato:
-    {{
-        "acao": "create"|"read"|"update"|"delete"|"chat", 
-        "resposta_amigavel": "texto da resposta", 
-        "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}
-    }}
+    Retorne JSON: {{"acao": "create"|"read"|"update"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
     """
     
-    contents = [prompt]
-    if audio_path:
-        file = await asyncio.to_thread(ia_client.files.upload, file=audio_path)
-        contents.insert(0, file)
-
+    # Alterado para o nome de modelo canônico que evita o 404
     response = await asyncio.to_thread(
         ia_client.models.generate_content, 
-        model='gemini-1.5-flash', 
-        contents=contents
+        model='models/gemini-1.5-flash', 
+        contents=prompt
     )
     
-    if audio_path: await asyncio.to_thread(ia_client.files.delete, name=file.name)
-    
-    # Limpeza manual de Markdown para evitar erros de parser
     res_text = response.text.strip()
-    if "```json" in res_text:
-        res_text = res_text.split("```json")[1].split("```")[0].strip()
-    elif "```" in res_text:
-        res_text = res_text.split("```")[1].split("```")[0].strip()
-        
+    if "```json" in res_text: res_text = res_text.split("```json")[1].split("```")[0].strip()
     return json.loads(res_text)
 
 # ==========================================
 # 4. CONTROLLER TELEGRAM
 # ==========================================
 async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
+    if not update.message or not update.message.text: return
     
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-        texto = update.message.text or ""
-        
         eventos = await calendar_action("list")
-        decisao = await process_intent_with_ai(texto, eventos)
+        decisao = await process_intent_with_ai(update.message.text, eventos)
         
         acao = decisao.get("acao")
         params = decisao.get("parametros", {})
@@ -146,19 +119,18 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
     except Exception as e:
         print(f"Erro no handle: {e}")
-        await update.message.reply_text("❌ Tive um problema ao processar sua solicitação. Verifique os logs.")
+        await update.message.reply_text("❌ Erro ao processar. Tente novamente.")
 
 # ==========================================
-# 5. FASTAPI & LIFESPAN
+# 5. FASTAPI & WEBHOOK
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-bot_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_update))
+bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
-    print("🚀 API Online na Railway.")
     yield
     await bot_app.stop()
     await bot_app.shutdown()
@@ -167,15 +139,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    try:
-        json_data = await request.json()
-        print(f"--- MENSAGEM RECEBIDA ---")
-        update = Update.de_json(json_data, bot_app.bot)
-        asyncio.create_task(bot_app.process_update(update))
-        return {"status": "ok"}
-    except Exception as e:
-        print(f"Erro no Webhook: {e}")
-        return {"status": "error"}
+    data = await request.json()
+    print("--- MENSAGEM RECEBIDA ---")
+    update = Update.de_json(data, bot_app.bot)
+    asyncio.create_task(bot_app.process_update(update))
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
