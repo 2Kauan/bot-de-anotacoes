@@ -5,7 +5,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
-import google.generativeai as genai  # SDK Estável
+import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
@@ -18,7 +18,7 @@ load_dotenv()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 
-# Configuração do SDK com força na versão v1 (estável)
+# Configuração GLOBAL do SDK
 genai.configure(api_key=GEMINI_KEY)
 
 # ==========================================
@@ -40,7 +40,7 @@ def _sync_list_events():
     if not service: return []
     now = datetime.datetime.utcnow().isoformat() + 'Z'
     try:
-        events = service.events().list(calendarId='primary', timeMin=now, maxResults=15, singleEvents=True, orderBy='startTime').execute()
+        events = service.events().list(calendarId='primary', timeMin=now, maxResults=10, singleEvents=True, orderBy='startTime').execute()
         return events.get('items', [])
     except: return []
 
@@ -67,7 +67,7 @@ async def calendar_action(action, **kwargs):
     elif action == "delete": return await asyncio.to_thread(_sync_delete_event, kwargs.get("id"))
 
 # ==========================================
-# 3. MOTOR DE INTELIGÊNCIA (FORÇANDO V1)
+# 3. MOTOR DE INTELIGÊNCIA (AJUSTE DE ROTA)
 # ==========================================
 async def process_intent_with_ai(prompt_text, current_events):
     agora = datetime.datetime.now()
@@ -77,26 +77,30 @@ async def process_intent_with_ai(prompt_text, current_events):
     
     prompt = f"""
     Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}.
-    Agenda: {json.dumps(eventos_simplificados, ensure_ascii=False)}
+    Agenda Atual: {json.dumps(eventos_simplificados, ensure_ascii=False)}
     
-    REGRA: IDs de eventos após {limite_48h.strftime("%Y-%m-%d %H:%M:%S")} NÃO podem ser deletados.
+    REGRA DE NEGÓCIO: Se o usuário pedir para apagar/cancelar, ignore qualquer ID de evento que comece DEPOIS DE {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}.
 
-    Mensagem: "{prompt_text}"
+    Mensagem do usuário: "{prompt_text}"
     
-    Retorne JSON: {{"acao": "create"|"read"|"update"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
+    Retorne OBRIGATORIAMENTE um JSON: 
+    {{"acao": "create"|"read"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
     """
     
-    # Inicializando o modelo explicitamente
+    # Criamos o modelo forçando a versão 1.5-flash
+    # Se o erro 404 persistir, tente trocar 'gemini-1.5-flash' por 'gemini-pro' como teste de diagnóstico
     model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # Chamada forçando a resposta em JSON
-    response = await asyncio.to_thread(
-        model.generate_content,
-        prompt,
-        generation_config={"response_mime_type": "application/json"}
-    )
-    
-    return json.loads(response.text)
+    try:
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        print(f"Erro na chamada Gemini: {e}")
+        return {"acao": "chat", "resposta_amigavel": "Erro na IA. Tente novamente.", "parametros": {}}
 
 # ==========================================
 # 4. CONTROLLER TELEGRAM
@@ -120,11 +124,11 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
     except Exception as e:
-        print(f"Erro no handle: {e}")
-        await update.message.reply_text("❌ Erro ao processar. Tente novamente.")
+        print(f"Erro no fluxo principal: {e}")
+        await update.message.reply_text("❌ Tive um problema interno. Verifique os logs da Railway.")
 
 # ==========================================
-# 5. FASTAPI & WEBHOOK
+# 5. FASTAPI & LIFESPAN
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
@@ -133,7 +137,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
-    print("🚀 API Online na Railway (V1 Estável).")
+    print("🚀 API Online na Railway (V1).")
     yield
     await bot_app.stop()
     await bot_app.shutdown()
@@ -144,6 +148,7 @@ app = FastAPI(lifespan=lifespan)
 async def telegram_webhook(request: Request):
     try:
         data = await request.json()
+        print("--- MENSAGEM RECEBIDA ---")
         update = Update.de_json(data, bot_app.bot)
         asyncio.create_task(bot_app.process_update(update))
         return {"status": "ok"}
