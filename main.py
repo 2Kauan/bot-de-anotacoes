@@ -21,7 +21,8 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-ia_client = genai.Client(api_key=GEMINI_KEY)
+# Inicialização com versão de API estável para evitar 404
+ia_client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1'})
 lembretes_enviados = set()
 
 # ==========================================
@@ -29,12 +30,17 @@ lembretes_enviados = set()
 # ==========================================
 def get_calendar_service():
     token_json = os.getenv("GOOGLE_TOKEN")
-    creds_dict = json.loads(token_json)
-    creds = Credentials.from_authorized_user_info(creds_dict)
-    return build('calendar', 'v3', credentials=creds)
+    try:
+        creds_dict = json.loads(token_json)
+        creds = Credentials.from_authorized_user_info(creds_dict)
+        return build('calendar', 'v3', credentials=creds)
+    except Exception as e:
+        print(f"ERRO CRÍTICO NO GOOGLE_TOKEN: {e}")
+        return None
 
 def _sync_list_events(max_days_ahead=30):
     service = get_calendar_service()
+    if not service: return []
     now = datetime.datetime.utcnow()
     time_max = (now + datetime.timedelta(days=max_days_ahead)).isoformat() + 'Z'
     now_iso = now.isoformat() + 'Z'
@@ -42,6 +48,7 @@ def _sync_list_events(max_days_ahead=30):
 
 def _sync_create_event(titulo, data_iso):
     service = get_calendar_service()
+    if not service: return None
     dt = datetime.datetime.fromisoformat(data_iso)
     event = {
         'summary': titulo,
@@ -52,6 +59,7 @@ def _sync_create_event(titulo, data_iso):
 
 def _sync_delete_event(event_id):
     service = get_calendar_service()
+    if not service: return False
     service.events().delete(calendarId='primary', eventId=event_id).execute()
     return True
 
@@ -81,7 +89,7 @@ async def process_intent_with_ai(prompt_text, current_events, audio_path=None):
 
     Mensagem: "{prompt_text}"
     
-    Retorne UM JSON: 
+    Retorne UM JSON puro: 
     {{"acao": "create"|"read"|"update"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
     """
     
@@ -90,10 +98,19 @@ async def process_intent_with_ai(prompt_text, current_events, audio_path=None):
         file = await asyncio.to_thread(ia_client.files.upload, file=audio_path)
         contents.insert(0, file)
 
-    response = await asyncio.to_thread(ia_client.models.generate_content, model='gemini-1.5-flash', contents=contents, config=types.GenerateContentConfig(response_mime_type="application/json"))
+    # Uso do nome do modelo completo para evitar 404
+    response = await asyncio.to_thread(
+        ia_client.models.generate_content, 
+        model='gemini-1.5-flash', 
+        contents=contents, 
+        config=types.GenerateContentConfig(response_mime_type="application/json")
+    )
     
     if audio_path: await asyncio.to_thread(ia_client.files.delete, name=file.name)
-    return json.loads(response.text)
+    
+    # Limpeza básica de possíveis blocos de código na resposta
+    res_text = response.text.strip().replace("```json", "").replace("```", "")
+    return json.loads(res_text)
 
 # ==========================================
 # 4. CONTROLLER TELEGRAM
@@ -120,7 +137,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
     except Exception as e:
         print(f"Erro no handle: {e}")
-        await update.message.reply_text("❌ Tive um problema. Tente novamente.")
+        await update.message.reply_text("❌ Tive um problema ao processar. Tente novamente.")
 
 # ==========================================
 # 5. FASTAPI & LIFESPAN
@@ -143,7 +160,7 @@ app = FastAPI(lifespan=lifespan)
 async def telegram_webhook(request: Request):
     try:
         json_data = await request.json()
-        print(f"--- MENSAGEM RECEBIDA ---") # Log de Monitoramento
+        print(f"--- MENSAGEM RECEBIDA ---")
         update = Update.de_json(json_data, bot_app.bot)
         asyncio.create_task(bot_app.process_update(update))
         return {"status": "ok"}
