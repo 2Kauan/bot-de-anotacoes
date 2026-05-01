@@ -78,7 +78,9 @@ async def calendar_action(action, **kwargs):
 # 3. MOTOR DE INTELIGÊNCIA (CHAMADA REST DIRETA)
 # ==========================================
 async def process_intent_with_ai(prompt_text, current_events):
-    agora = datetime.datetime.now()
+    # Fuso horário de Jaicós (Piauí) - UTC-3
+    fuso = datetime.timezone(datetime.timedelta(hours=-3))
+    agora = datetime.datetime.now(fuso)
     limite_48h = agora + datetime.timedelta(hours=48)
     
     eventos_simplificados = [
@@ -94,7 +96,7 @@ async def process_intent_with_ai(prompt_text, current_events):
 
     Mensagem do usuário: "{prompt_text}"
     
-    Retorne OBRIGATORIAMENTE apenas um JSON puro: 
+    Retorne OBRIGATORIAMENTE apenas um JSON puro, sem blocos de código markdown (sem ```json): 
     {{
         "acao": "create"|"read"|"delete"|"chat", 
         "resposta_amigavel": "...", 
@@ -102,12 +104,11 @@ async def process_intent_with_ai(prompt_text, current_events):
     }}
     """
 
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    url = f"[https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=){GEMINI_KEY}"
+    
+    # Payload simplificado para evitar erro 400 (Invalid JSON payload)
     payload = {
-        "contents": [{"parts": [{"text": prompt_completo}]}],
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
+        "contents": [{"parts": [{"text": prompt_completo}]}]
     }
 
     try:
@@ -119,12 +120,17 @@ async def process_intent_with_ai(prompt_text, current_events):
             raise Exception(f"Status {response.status_code}")
 
         texto_ia = res_json['candidates'][0]['content']['parts'][0]['text']
-        return json.loads(texto_ia)
+        
+        # Limpeza robusta para garantir que pegamos apenas o JSON
+        json_limpo = texto_ia.replace("```json", "").replace("
+```", "").strip()
+        
+        return json.loads(json_limpo)
     except Exception as e:
         print(f"Erro na chamada Gemini: {e}")
         return {
             "acao": "chat", 
-            "resposta_amigavel": "❌ Tive uma instabilidade na minha lógica. Pode repetir?", 
+            "resposta_amigavel": "❌ Tive uma instabilidade técnica na minha lógica. Pode repetir o comando?", 
             "parametros": {}
         }
 
@@ -137,17 +143,17 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
         
-        # 1. Busca eventos atuais
+        # 1. Busca eventos atuais para dar contexto à IA
         eventos = await calendar_action("list")
         
-        # 2. Processa intenção com IA
+        # 2. Processa intenção
         decisao = await process_intent_with_ai(update.message.text, eventos)
         
         acao = decisao.get("acao")
         params = decisao.get("parametros", {})
-        msg_resposta = decisao.get("resposta_amigavel", "Processado.")
+        msg_resposta = decisao.get("resposta_amigavel", "Processado com sucesso.")
 
-        # 3. Executa ação no Calendário
+        # 3. Executa ações baseadas na decisão
         if acao == "create":
             await calendar_action("create", titulo=params.get("titulo"), data=params.get("data_inicio"))
         elif acao == "delete":
@@ -158,8 +164,8 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg_resposta, parse_mode='Markdown')
         
     except Exception as e:
-        print(f"Erro no fluxo handle_update: {e}")
-        await update.message.reply_text("❌ Tive um problema interno. Tente novamente em instantes.")
+        print(f"Erro no fluxo principal: {e}")
+        await update.message.reply_text("❌ Tive um problema interno ao processar sua mensagem.")
 
 # ==========================================
 # 5. FASTAPI & LIFESPAN
@@ -169,10 +175,12 @@ bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Inicialização do Bot ao subir o container
     await bot_app.initialize()
     await bot_app.start()
-    print("🚀 API Online na Railway (Fluxo REST Direto).")
+    print("🚀 Bot Online na Railway. Rota /webhook ativa.")
     yield
+    # Shutdown limpo do Bot ao parar o container
     await bot_app.stop()
     await bot_app.shutdown()
 
@@ -182,16 +190,20 @@ app = FastAPI(lifespan=lifespan)
 async def telegram_webhook(request: Request):
     try:
         data = await request.json()
-        print("--- MENSAGEM RECEBIDA ---")
         update = Update.de_json(data, bot_app.bot)
+        # Processamento assíncrono do update
         asyncio.create_task(bot_app.process_update(update))
         return {"status": "ok"}
     except Exception as e:
-        print(f"Erro no Webhook: {e}")
+        print(f"Erro no recebimento do Webhook: {e}")
         return {"status": "error"}
+
+@app.get("/")
+async def health_check():
+    return {"status": "online", "message": "Bot de Anotações Inteligente operando."}
 
 if __name__ == "__main__":
     import uvicorn
-    # A Railway injeta a porta automaticamente na variável de ambiente PORT
+    # Porta dinâmica para Railway
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
