@@ -21,7 +21,7 @@ GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Inicialização com versão de API estável para evitar 404
+# Inicialização estável
 ia_client = genai.Client(api_key=GEMINI_KEY, http_options={'api_version': 'v1'})
 lembretes_enviados = set()
 
@@ -31,6 +31,9 @@ lembretes_enviados = set()
 def get_calendar_service():
     token_json = os.getenv("GOOGLE_TOKEN")
     try:
+        if not token_json:
+            print("ERRO: GOOGLE_TOKEN não configurado nas variáveis da Railway.")
+            return None
         creds_dict = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(creds_dict)
         return build('calendar', 'v3', credentials=creds)
@@ -82,15 +85,18 @@ async def process_intent_with_ai(prompt_text, current_events, audio_path=None):
     
     prompt = f"""
     Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}.
-    Agenda: {json.dumps(eventos_simplificados, ensure_ascii=False)}
+    Agenda Atual: {json.dumps(eventos_simplificados, ensure_ascii=False)}
     
-    REGRA CRÍTICA: Se o usuário pedir para deletar ou alterar algo, você SÓ PODE incluir no 'event_ids' eventos que comecem ANTES DE {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}. 
-    Se o evento for após esse horário, ignore o pedido de exclusão para ele e explique na resposta amigável.
+    INSTRUÇÃO DE SEGURANÇA: Se o usuário pedir para apagar ou alterar eventos, você só pode incluir no campo 'event_ids' os IDs de eventos que começam ANTES de {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}. Para eventos após esse horário, informe ao usuário que você não tem permissão para remover.
 
-    Mensagem: "{prompt_text}"
+    Mensagem do usuário: "{prompt_text}"
     
-    Retorne UM JSON puro: 
-    {{"acao": "create"|"read"|"update"|"delete"|"chat", "resposta_amigavel": "...", "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}}}
+    Retorne estritamente um JSON no formato:
+    {{
+        "acao": "create"|"read"|"update"|"delete"|"chat", 
+        "resposta_amigavel": "texto da resposta", 
+        "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}
+    }}
     """
     
     contents = [prompt]
@@ -98,18 +104,21 @@ async def process_intent_with_ai(prompt_text, current_events, audio_path=None):
         file = await asyncio.to_thread(ia_client.files.upload, file=audio_path)
         contents.insert(0, file)
 
-    # Uso do nome do modelo completo para evitar 404
     response = await asyncio.to_thread(
         ia_client.models.generate_content, 
         model='gemini-1.5-flash', 
-        contents=contents, 
-        config=types.GenerateContentConfig(response_mime_type="application/json")
+        contents=contents
     )
     
     if audio_path: await asyncio.to_thread(ia_client.files.delete, name=file.name)
     
-    # Limpeza básica de possíveis blocos de código na resposta
-    res_text = response.text.strip().replace("```json", "").replace("```", "")
+    # Limpeza manual de Markdown para evitar erros de parser
+    res_text = response.text.strip()
+    if "```json" in res_text:
+        res_text = res_text.split("```json")[1].split("```")[0].strip()
+    elif "```" in res_text:
+        res_text = res_text.split("```")[1].split("```")[0].strip()
+        
     return json.loads(res_text)
 
 # ==========================================
@@ -137,7 +146,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
     except Exception as e:
         print(f"Erro no handle: {e}")
-        await update.message.reply_text("❌ Tive um problema ao processar. Tente novamente.")
+        await update.message.reply_text("❌ Tive um problema ao processar sua solicitação. Verifique os logs.")
 
 # ==========================================
 # 5. FASTAPI & LIFESPAN
