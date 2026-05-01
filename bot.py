@@ -31,8 +31,10 @@ def parse_message(text):
     dia = int(match.group(1))
     mes = meses.get(match.group(2))
 
-    titulo = text.split(match.group(0))[-1].strip()
+    if not mes:
+        return None
 
+    titulo = text.split(match.group(0))[-1].strip()
     if not titulo:
         titulo = "Evento"
 
@@ -64,7 +66,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_message(text)
 
     if not parsed:
-        await update.message.reply_text("Use: Dia X de mês ...")
+        await update.message.reply_text("Use: Dia X de mês (ex: Dia 12 de dezembro comprar fone)")
         return
 
     titulo, data = parsed
@@ -75,12 +77,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Evento criado: {titulo} em {data.strftime('%d/%m %H:%M')}"
     )
 
+# ===== TOKEN =====
+raw_token = os.getenv("TELEGRAM_TOKEN")
+print("DEBUG TOKEN RAW:", repr(raw_token))
+
+TOKEN = (raw_token or "").strip()
+
+if not TOKEN or TOKEN.lower() == "none":
+    raise ValueError("Token do Telegram inválido ou não definido. Configure TELEGRAM_TOKEN.")
+
+print("TOKEN OK")
+
 # ===== INICIAR BOT =====
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-
-if not TOKEN:
-    raise ValueError("Token do Telegram não encontrado. Configure a variável TELEGRAM_TOKEN.")
-
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT, handle_message))
