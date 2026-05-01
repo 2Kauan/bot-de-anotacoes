@@ -1,10 +1,27 @@
-fastapi
-uvicorn
-python-dotenv
-google-generativeai
-python-telegram-bot
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
-apscheduler
-requests
+# ==========================================
+# BOT DE AGENDA INTELIGENTE V2.0
+# Dependências Python
+# ==========================================
+
+# Bot Telegram
+python-telegram-bot==20.7
+
+# API Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-dotenv==1.0.0
+
+# Google Calendar
+google-api-python-client==2.116.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
+
+# IA (opcional - só se usar)
+# google-generativeai==0.3.2  # Para Gemini SDK (se quiser usar SDK)
+# groq==0.4.1  # Para Groq API (alternativa)
+
+# Requests (para chamadas REST)
+requests==2.31.0
+
+# Utilidades
+python-json-logger==2.0.7
