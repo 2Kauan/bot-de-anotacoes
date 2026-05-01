@@ -24,12 +24,14 @@ TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 def get_calendar_service():
     token_json = os.getenv("GOOGLE_TOKEN")
     try:
-        if not token_json: return None
+        if not token_json: 
+            print("ERRO: Variável GOOGLE_TOKEN não encontrada.")
+            return None
         creds_dict = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(creds_dict)
         return build('calendar', 'v3', credentials=creds)
     except Exception as e:
-        print(f"Erro no Token Google: {e}")
+        print(f"Erro ao carregar credenciais Google: {e}")
         return None
 
 def _sync_list_events():
@@ -37,12 +39,14 @@ def _sync_list_events():
     if not service: return []
     now = datetime.datetime.utcnow().isoformat() + 'Z'
     try:
-        events = service.events().list(
+        events_result = service.events().list(
             calendarId='primary', timeMin=now, maxResults=15, 
             singleEvents=True, orderBy='startTime'
         ).execute()
-        return events.get('items', [])
-    except: return []
+        return events_result.get('items', [])
+    except Exception as e:
+        print(f"Erro ao listar eventos: {e}")
+        return []
 
 def _sync_create_event(titulo, data_iso):
     service = get_calendar_service()
@@ -58,8 +62,12 @@ def _sync_create_event(titulo, data_iso):
 def _sync_delete_event(event_id):
     service = get_calendar_service()
     if not service: return False
-    service.events().delete(calendarId='primary', eventId=event_id).execute()
-    return True
+    try:
+        service.events().delete(calendarId='primary', eventId=event_id).execute()
+        return True
+    except Exception as e:
+        print(f"Erro ao deletar evento {event_id}: {e}")
+        return False
 
 async def calendar_action(action, **kwargs):
     if action == "list": return await asyncio.to_thread(_sync_list_events)
@@ -67,7 +75,7 @@ async def calendar_action(action, **kwargs):
     elif action == "delete": return await asyncio.to_thread(_sync_delete_event, kwargs.get("id"))
 
 # ==========================================
-# 3. MOTOR DE INTELIGÊNCIA (CHAMADA DIRETA REST)
+# 3. MOTOR DE INTELIGÊNCIA (CHAMADA REST DIRETA)
 # ==========================================
 async def process_intent_with_ai(prompt_text, current_events):
     agora = datetime.datetime.now()
@@ -80,9 +88,9 @@ async def process_intent_with_ai(prompt_text, current_events):
     
     prompt_completo = f"""
     Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}.
-    Agenda: {json.dumps(eventos_simplificados, ensure_ascii=False)}
+    Agenda Atual: {json.dumps(eventos_simplificados, ensure_ascii=False)}
     
-    REGRA CRÍTICA: Se o usuário pedir para apagar/cancelar eventos, ignore qualquer ID de evento que comece DEPOIS DE {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}. Informe que não pode apagar compromissos futuros distantes.
+    REGRA CRÍTICA: Se o usuário pedir para apagar/cancelar, ignore qualquer ID de evento que comece DEPOIS DE {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}.
 
     Mensagem do usuário: "{prompt_text}"
     
@@ -94,15 +102,16 @@ async def process_intent_with_ai(prompt_text, current_events):
     }}
     """
 
-    # Forçando a rota estável v1 via HTTP direto
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt_completo}]}],
-        "generationConfig": {"response_mime_type": "application/json"}
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
     }
 
     try:
-        response = await asyncio.to_thread(requests.post, url, json=payload, timeout=10)
+        response = await asyncio.to_thread(requests.post, url, json=payload, timeout=12)
         res_json = response.json()
         
         if response.status_code != 200:
@@ -115,7 +124,7 @@ async def process_intent_with_ai(prompt_text, current_events):
         print(f"Erro na chamada Gemini: {e}")
         return {
             "acao": "chat", 
-            "resposta_amigavel": "❌ Tive um problema de comunicação com minha inteligência. Tente novamente.", 
+            "resposta_amigavel": "❌ Tive uma instabilidade na minha lógica. Pode repetir?", 
             "parametros": {}
         }
 
@@ -127,22 +136,30 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        
+        # 1. Busca eventos atuais
         eventos = await calendar_action("list")
+        
+        # 2. Processa intenção com IA
         decisao = await process_intent_with_ai(update.message.text, eventos)
         
         acao = decisao.get("acao")
         params = decisao.get("parametros", {})
+        msg_resposta = decisao.get("resposta_amigavel", "Processado.")
 
+        # 3. Executa ação no Calendário
         if acao == "create":
             await calendar_action("create", titulo=params.get("titulo"), data=params.get("data_inicio"))
         elif acao == "delete":
-            for eid in params.get("event_ids", []):
+            ids = params.get("event_ids", [])
+            for eid in ids:
                 await calendar_action("delete", id=eid)
 
-        await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
+        await update.message.reply_text(msg_resposta, parse_mode='Markdown')
+        
     except Exception as e:
-        print(f"Erro no fluxo principal: {e}")
-        await update.message.reply_text("❌ Erro ao processar. Verifique os logs na Railway.")
+        print(f"Erro no fluxo handle_update: {e}")
+        await update.message.reply_text("❌ Tive um problema interno. Tente novamente em instantes.")
 
 # ==========================================
 # 5. FASTAPI & LIFESPAN
@@ -154,7 +171,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
-    print("🚀 API Online na Railway (Rota Direta v1).")
+    print("🚀 API Online na Railway (Fluxo REST Direto).")
     yield
     await bot_app.stop()
     await bot_app.shutdown()
@@ -169,10 +186,12 @@ async def telegram_webhook(request: Request):
         update = Update.de_json(data, bot_app.bot)
         asyncio.create_task(bot_app.process_update(update))
         return {"status": "ok"}
-    except:
+    except Exception as e:
+        print(f"Erro no Webhook: {e}")
         return {"status": "error"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    # A Railway injeta a porta automaticamente na variável de ambiente PORT
+    port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
