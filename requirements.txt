@@ -6,7 +6,6 @@ google-auth-httplib2
 google-auth-oauthlib
 requests
 python-dotenv
-apscheduler
 arrow
 pydantic
 loguru

@@ -21,9 +21,9 @@ load_dotenv()
 # 1. MODELAGEM DE DADOS (PYDANTIC)
 # ==========================================
 class LumiAction(BaseModel):
-    """Esquema rigoroso para a tomada de decisão da IA"""
+    """Esquema para a tomada de decisão da IA"""
     acao: Literal["create", "read", "delete", "chat"]
-    resposta_amigavel: str = Field(..., description="Fala da Lumi com emojis e calor humano")
+    resposta_amigavel: str = Field(..., description="Fala da Lumi com emojis")
     titulo: Optional[str] = None
     data_inicio: Optional[str] = None
     event_id: Optional[str] = None
@@ -42,22 +42,24 @@ CATEGORIAS = {"Estudo": "1", "Academia": "10", "Trabalho": "7", "Lazer": "5"}
 # ==========================================
 def get_calendar():
     try:
-        creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
+        token_data = os.getenv("GOOGLE_TOKEN")
+        if not token_data: return None
+        creds = Credentials.from_authorized_user_info(json.loads(token_data))
         return build('calendar', 'v3', credentials=creds)
     except Exception as e:
-        logger.error(f"Falha na conexão Google: {e}")
+        logger.error(f"Falha Google Calendar: {e}")
         return None
 
 def manage_event(action: LumiAction):
     service = get_calendar()
-    if not service: return False
+    if not service: return None
 
     try:
-        if action.acao == "create":
-            # Arrow garante precisão cirúrgica no fuso de Jaicós
+        if action.acao == "create" and action.data_inicio:
+            # Arrow garante precisão em Jaicós
             start = arrow.get(action.data_inicio).replace(tzinfo='America/Sao_Paulo')
             event = {
-                'summary': action.titulo,
+                'summary': action.titulo or "Compromisso",
                 'colorId': action.color_id if action.color_id in [str(i) for i in range(1,12)] else "1",
                 'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
                 'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
@@ -74,27 +76,24 @@ def manage_event(action: LumiAction):
         return None
 
 # ==========================================
-# 4. INTELIGÊNCIA ARTIFICIAL (GROQ)
+# 4. INTELIGÊNCIA ARTIFICIAL (GROQ + FALLBACK)
 # ==========================================
 async def ask_lumi(prompt_user: str, context_events: list) -> LumiAction:
     agora = arrow.now('America/Sao_Paulo')
     
-    # Contexto rico para evitar que ela "burreie"
+    # Contexto simplificado para não poluir o prompt
     agenda_view = [{"id": e['id'], "summary": e.get('summary'), "start": e['start'].get('dateTime')} for e in context_events]
 
     system_prompt = f"""
-    Seu nome é Lumi, assistente elite do Kauan em Jaicós, PI.
-    Hoje: {agora.format('dddd, DD/MM/YYYY HH:mm')}.
+    Seu nome é Lumi, assistente do Kauan em Jaicós, PI.
+    Agora: {agora.format('dddd, DD/MM/YYYY HH:mm')}.
 
-    DIRETRIZES:
-    1. Se ele pedir para apagar/remover, identifique o ID na lista abaixo.
-    2. Se pedir para agendar, use ISO8601 com fuso -03:00.
-    3. Seja feminina, expressiva e use emojis.
+    OBJETIVO:
+    Responda APENAS um JSON plano com "acao" e "resposta_amigavel".
+    Categorias: {json.dumps(CATEGORIAS)}
+    Agenda: {json.dumps(agenda_view)}
     
-    CATEGORIAS: {json.dumps(CATEGORIAS)}
-    AGENDA RECENTE: {json.dumps(agenda_view)}
-
-    Responda EXCLUSIVAMENTE em JSON seguindo o esquema Pydantic.
+    VALORES PARA 'acao': 'create', 'read', 'delete', 'chat'.
     """
 
     try:
@@ -103,51 +102,71 @@ async def ask_lumi(prompt_user: str, context_events: list) -> LumiAction:
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
                 "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt_user}],
+                "messages": [
+                    {"role": "system", "content": system_prompt}, 
+                    {"role": "user", "content": prompt_user}
+                ],
                 "response_format": {"type": "json_object"}
             },
             timeout=15
         )
-        # Validação via Pydantic
-        return LumiAction.model_validate_json(res.json()['choices'][0]['message']['content'])
+        
+        raw_content = res.json()['choices'][0]['message']['content']
+        logger.info(f"IA Respondeu: {raw_content}")
+
+        # Lógica de Validação com Fallback
+        try:
+            return LumiAction.model_validate_json(raw_content)
+        except ValidationError:
+            # Caso a IA coloque a resposta dentro de uma chave como {"resposta": {...}}
+            data = json.loads(raw_content)
+            inner = data.get("resposta") or data.get("lumi") or data.get("data") or data
+            return LumiAction.model_validate(inner)
+
     except Exception as e:
-        logger.error(f"Erro Groq/Pydantic: {e}")
-        return LumiAction(acao="chat", resposta_amigavel="Kauan, tive um pequeno soluço digital... pode repetir? 🌸")
+        logger.error(f"Erro Crítico ask_lumi: {e}")
+        return LumiAction(acao="chat", resposta_amigavel="Kauan, tive um soluço técnico... pode repetir? 🌸")
 
 # ==========================================
-# 5. HANDLER TELEGRAM (FLUXO PRINCIPAL)
+# 5. HANDLER TELEGRAM
 # ==========================================
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
 
-    logger.info(f"Mensagem recebida: {update.message.text}")
+    logger.info(f"Mensagem: {update.message.text}")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
 
-    # Busca contexto preventivo
+    # Busca contexto do dia (00:00 até 23:59)
     service = get_calendar()
-    hoje = arrow.now('America/Sao_Paulo').floor('day')
-    eventos_hoje = service.events().list(calendarId='primary', timeMin=hoje.isoformat()).execute().get('items', []) if service else []
-
-    # Processa IA
-    decisao = await ask_lumi(update.message.text, eventos_hoje)
+    hoje_start = arrow.now('America/Sao_Paulo').floor('day').isoformat()
+    hoje_end = arrow.now('America/Sao_Paulo').ceil('day').isoformat()
     
-    # Execução
+    eventos_dia = []
+    if service:
+        eventos_dia = service.events().list(calendarId='primary', timeMin=hoje_start, timeMax=hoje_end, singleEvents=True).execute().get('items', [])
+
+    # IA decide o que fazer
+    decisao = await ask_lumi(update.message.text, eventos_dia)
+    
+    # Executa ação no Calendar se necessário
     resultado = manage_event(decisao)
     
     final_msg = decisao.resposta_amigavel
+    
     if decisao.acao == "create" and resultado:
         final_msg += f"\n\n✨ [Evento fixado na agenda!]({resultado.get('htmlLink')})"
+    
     elif decisao.acao == "read":
-        if not eventos_hoje:
-            final_msg += "\n\nNada agendado por enquanto! 🌸"
+        if not eventos_dia:
+            final_msg += "\n\nNada agendado para hoje! 🌸"
         else:
-            lista = "\n".join([f"• *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos_hoje])
+            lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos_dia])
             final_msg += f"\n\n{lista}"
 
     await update.message.reply_text(final_msg, parse_mode='Markdown', disable_web_page_preview=True)
 
 # ==========================================
-# 6. INFRAESTRUTURA (LIFESPAN & WEBHOOK)
+# 6. INFRA (FASTAPI + WEBHOOK)
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
@@ -156,7 +175,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
-    logger.info("Lumi Inicializada com sucesso!")
+    logger.info("Lumi v3.1 Online em Jaicós!")
     yield
     await bot_app.stop()
 
