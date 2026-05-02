@@ -11,111 +11,181 @@ load_dotenv()
 
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-# Pega o ID do Kauan para segurança
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
-# --- CALENDAR ENGINE ---
+TZ = "America/Sao_Paulo"
+
+# memória simples (último evento usado)
+MEMORY = {"last_event_id": None}
+
+# --- CALENDAR ---
 def get_calendar():
     try:
         creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
         return build('calendar', 'v3', credentials=creds)
-    except: return None
+    except:
+        return None
 
 def create_ev(titulo, data_iso):
     service = get_calendar()
     if not service: return None
-    try:
-        start = arrow.get(data_iso).replace(tzinfo='America/Sao_Paulo')
-        event = {
-            'summary': titulo,
-            'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
-            'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
-        }
-        return service.events().insert(calendarId='primary', body=event).execute()
-    except: return None
+    start = arrow.get(data_iso).to(TZ)
+
+    event = {
+        'summary': titulo,
+        'start': {'dateTime': start.isoformat(), 'timeZone': TZ},
+        'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ},
+    }
+
+    res = service.events().insert(calendarId='primary', body=event).execute()
+    MEMORY["last_event_id"] = res["id"]
+    return res
+
+def update_ev(eid, nova_data):
+    service = get_calendar()
+    if not service: return False
+
+    event = service.events().get(calendarId='primary', eventId=eid).execute()
+
+    start = arrow.get(nova_data).to(TZ)
+    event['start'] = {'dateTime': start.isoformat(), 'timeZone': TZ}
+    event['end'] = {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ}
+
+    service.events().update(calendarId='primary', eventId=eid, body=event).execute()
+    return True
 
 def delete_ev(eid):
     service = get_calendar()
     if not service: return False
-    try:
-        service.events().delete(calendarId='primary', eventId=eid).execute()
-        return True
-    except: return False
+    service.events().delete(calendarId='primary', eventId=eid).execute()
+    return True
 
-def list_evs(t_min, t_max):
+def list_evs():
     service = get_calendar()
     if not service: return []
-    try:
-        return service.events().list(calendarId='primary', timeMin=t_min, timeMax=t_max, singleEvents=True, orderBy='startTime').execute().get('items', [])
-    except: return []
 
-# --- AI ENGINE ---
-async def ask_lumi(user_input, context_str):
-    agora = arrow.now('America/Sao_Paulo')
+    now = arrow.now(TZ)
+    events = service.events().list(
+        calendarId='primary',
+        timeMin=now.floor('day').isoformat(),
+        timeMax=now.shift(days=7).ceil('day').isoformat(),
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute().get('items', [])
+
+    return events
+
+# --- IA ---
+async def ask_lumi(user_input, context_list):
+    agora = arrow.now(TZ)
+
+    ctx_text = "\n".join([
+        f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}"
+        for i, e in enumerate(context_list)
+    ])
+
     system = f"""
-    Nome: Lumi. Papel: Assistente de Agenda.
-    Agora: {agora.format('YYYY-MM-DD HH:mm')} (Jaicós/PI).
-    
-    CONTEXTO (Eventos próximos):
-    {context_str}
+Você é uma assistente de agenda.
 
-    REGRAS TÉCNICAS:
-    - Retorne APENAS JSON.
-    - Criar: {{"acao": "create", "titulo": "...", "data": "ISO"}}
-    - Apagar: {{"acao": "delete", "id": "ID_DO_CONTEXTO"}}
-    - Listar: {{"acao": "read"}}
-    - Conversar: {{"acao": "chat", "msg": "..."}}
-    """
+Agora: {agora.format('DD/MM HH:mm')}
+
+Eventos:
+{ctx_text}
+
+REGRAS:
+- Nunca invente IDs
+- Use "index" (posição da lista) para update/delete
+- Se usuário disser "coloca para 14h", use último evento
+
+RETORNE JSON:
+
+Criar:
+{{"acao":"create","titulo":"...","data":"ISO"}}
+
+Atualizar:
+{{"acao":"update","index":0,"data":"ISO"}}
+
+Deletar:
+{{"acao":"delete","index":0}}
+
+Listar:
+{{"acao":"read"}}
+
+Conversa:
+{{"acao":"chat","msg":"..."}}
+"""
+
     try:
-        res = requests.post("https://api.groq.com/openai/v1/chat/completions",
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_input}],
+                "model": "llama-3.1-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_input}
+                ],
                 "response_format": {"type": "json_object"}
-            }, timeout=10)
+            },
+            timeout=15
+        )
+
         return res.json()['choices'][0]['message']['content']
-    except: return json.dumps({"acao": "chat", "msg": "Tive um erro, Kauan. 😕"})
 
-# --- TELEGRAM HANDLER ---
+    except:
+        return json.dumps({"acao": "chat", "msg": "Erro na IA 😕"})
+
+# --- TELEGRAM ---
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    
-    agora = arrow.now('America/Sao_Paulo')
-    eventos = list_evs(agora.shift(days=-7).floor('day').isoformat(), agora.shift(days=7).ceil('day').isoformat())
-    ctx_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} | {e.get('summary')}" for e in eventos])
+    if not update.message or update.effective_user.id != MEU_ID_TELEGRAM:
+        return
 
-    raw = await ask_lumi(update.message.text or "oi", ctx_str)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+
+    eventos = list_evs()
+    raw = await ask_lumi(update.message.text, eventos)
+
     try:
         data = json.loads(raw)
         acao = data.get("acao")
-        
-        if acao == "create":
-            res = create_ev(data.get("titulo"), data.get("data"))
-            msg = f"✅ Criado: *{data.get('titulo')}* para às {arrow.get(data.get('data')).format('HH:mm')}! ✨" if res else "Erro ao criar. ❌"
-        
-        elif acao == "delete":
-            msg = "🗑️ Evento removido com sucesso! ✨" if delete_ev(data.get("id")) else "Não achei esse evento para apagar. 🧐"
-            
-        elif acao == "read":
-            if not eventos: msg = "Sua agenda está vazia nos próximos dias! 🌸"
-            else:
-                hoje_str = agora.format('DD/MM')
-                lista = []
-                for e in eventos:
-                    dt = arrow.get(e['start'].get('dateTime')).format('DD/MM')
-                    hr = arrow.get(e['start'].get('dateTime')).format('HH:mm')
-                    prefixo = "📍 Hoje" if dt == hoje_str else f"📅 {dt}"
-                    lista.append(f"{prefixo} - *{hr}*: {e.get('summary')}")
-                msg = "📋 *Sua Agenda:*\n\n" + "\n".join(lista)
-        
-        else: msg = data.get("msg", "Oi Kauan! Como posso ajudar na sua agenda hoje? 🌸")
 
-        await update.message.reply_text(msg, parse_mode='Markdown')
-    except:
-        await update.message.reply_text("Me enrolei aqui. Pode repetir? 😕")
+        if acao == "create":
+            ev = create_ev(data["titulo"], data["data"])
+            msg = f"✅ {data['titulo']} criado!"
+
+        elif acao == "update":
+            idx = data.get("index")
+
+            if idx is None:
+                eid = MEMORY["last_event_id"]
+            else:
+                eid = eventos[idx]["id"]
+
+            ok = update_ev(eid, data["data"])
+            msg = "🕒 Atualizado!" if ok else "Erro ao atualizar"
+
+        elif acao == "delete":
+            eid = eventos[data["index"]]["id"]
+            ok = delete_ev(eid)
+            msg = "🗑️ Removido!" if ok else "Erro"
+
+        elif acao == "read":
+            if not eventos:
+                msg = "Agenda vazia 🌸"
+            else:
+                linhas = []
+                for e in eventos:
+                    dt = arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')
+                    linhas.append(f"📅 {dt} - {e.get('summary')}")
+                msg = "\n".join(linhas)
+
+        else:
+            msg = data.get("msg", "🤖")
+
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {str(e)}")
 
 # --- INFRA ---
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -123,21 +193,19 @@ bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot_app.initialize(); await bot_app.start(); yield; await bot_app.stop()
+    await bot_app.initialize()
+    await bot_app.start()
+    yield
+    await bot_app.stop()
 
 app = FastAPI(lifespan=lifespan)
 
-# NOVO: Rota Raiz para evitar erro 404 nos logs da Render
 @app.get("/")
 async def root():
-    return {"status": "Lumi Online e Operante! 🌸"}
+    return {"status": "online"}
 
-# NOVO: Webhook flexível que aceita o link mesmo com erros de caracteres
-@app.post("/webhook{full_path:path}")
-async def webhook(request: Request, full_path: str = ""):
-    try:
-        data = await request.json()
-        await bot_app.process_update(Update.de_json(data, bot_app.bot))
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    await bot_app.process_update(Update.de_json(data, bot_app.bot))
+    return {"ok": True}
