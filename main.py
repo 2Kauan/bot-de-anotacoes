@@ -1,48 +1,26 @@
-import os
-import json
-import arrow
-import requests
+import os, json, arrow, requests
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
-from loguru import logger
 from dotenv import load_dotenv
-
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 load_dotenv()
 
-# ==========================================
-# 1. CONFIGURAÇÕES BÁSICAS
-# ==========================================
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
-# ==========================================
-# 2. FERRAMENTAS DE AGENDA (CRUD)
-# ==========================================
+# --- CALENDAR ENGINE ---
 def get_calendar():
     try:
-        token_data = os.getenv("GOOGLE_TOKEN")
-        creds = Credentials.from_authorized_user_info(json.loads(token_data))
+        creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
         return build('calendar', 'v3', credentials=creds)
     except: return None
 
-def list_events(time_min, time_max):
-    service = get_calendar()
-    if not service: return []
-    try:
-        res = service.events().list(
-            calendarId='primary', timeMin=time_min, timeMax=time_max,
-            singleEvents=True, orderBy='startTime'
-        ).execute()
-        return res.get('items', [])
-    except: return []
-
-def create_event(titulo, data_iso):
+def create_ev(titulo, data_iso):
     service = get_calendar()
     if not service: return None
     try:
@@ -55,150 +33,98 @@ def create_event(titulo, data_iso):
         return service.events().insert(calendarId='primary', body=event).execute()
     except: return None
 
-def delete_event(event_id):
+def delete_ev(eid):
     service = get_calendar()
     if not service: return False
     try:
-        service.events().delete(calendarId='primary', eventId=event_id).execute()
+        service.events().delete(calendarId='primary', eventId=eid).execute()
         return True
     except: return False
 
-# ==========================================
-# 3. COMANDOS DIRETOS (SEM IA - 100% SEGURO)
-# ==========================================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🌸 *Lumi Online!* Como posso ajudar, Kauan?\n\n"
-        "🚀 *Comandos Rápidos:*\n"
-        "/hoje - Ver sua agenda de hoje\n"
-        "/amanha - Ver sua agenda de amanhã\n"
-        "/limpar - Apagar TUDO de hoje\n\n"
-        "Ou pode me mandar áudio ou texto que eu uso minha inteligência! ✨"
-    )
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-async def hoje_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hoje = arrow.now('America/Sao_Paulo')
-    eventos = list_events(hoje.floor('day').isoformat(), hoje.ceil('day').isoformat())
-    if not eventos:
-        return await update.message.reply_text("Agenda limpinha para hoje! 🌸")
-    lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos])
-    await update.message.reply_text(f"📅 *Hoje em Jaicós:*\n\n{lista}", parse_mode='Markdown')
-
-async def amanha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amanha = arrow.now('America/Sao_Paulo').shift(days=1)
-    eventos = list_events(amanha.floor('day').isoformat(), amanha.ceil('day').isoformat())
-    if not eventos:
-        return await update.message.reply_text("Nada agendado para amanhã ainda! ✨")
-    lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos])
-    await update.message.reply_text(f"📅 *Amanhã:*\n\n{lista}", parse_mode='Markdown')
-
-async def limpar_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hoje = arrow.now('America/Sao_Paulo')
-    eventos = list_events(hoje.floor('day').isoformat(), hoje.ceil('day').isoformat())
-    if not eventos:
-        return await update.message.reply_text("Nada para limpar hoje! 😂")
-    for e in eventos:
-        delete_event(e['id'])
-    await update.message.reply_text("🗑️ TUDO limpo! Sua agenda de hoje foi zerada. ✨")
-
-# ==========================================
-# 4. INTELIGÊNCIA ARTIFICIAL (VOZ E TEXTO)
-# ==========================================
-async def transcribe_audio(file_path):
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}"}
+def list_evs(t_min, t_max):
+    service = get_calendar()
+    if not service: return []
     try:
-        with open(file_path, "rb") as f:
-            files = {"file": ("audio.ogg", f), "model": (None, "whisper-large-v3")}
-            response = requests.post(url, headers=headers, files=files, timeout=20)
-        return response.json().get("text", "")
-    except: return ""
+        return service.events().list(calendarId='primary', timeMin=t_min, timeMax=t_max, singleEvents=True, orderBy='startTime').execute().get('items', [])
+    except: return []
 
+# --- AI ENGINE ---
 async def ask_lumi(user_input, context_str):
     agora = arrow.now('America/Sao_Paulo')
-    system_prompt = f"""
-    Nome: Lumi. Assistente do Kauan em Jaicós, PI.
-    Agora: {agora.format('DD/MM/YYYY HH:mm')}.
-    AGENDA RECENTE (Ontem a Amanhã): {context_str}
+    system = f"""
+    Nome: Lumi. Papel: Assistente de Agenda.
+    Agora: {agora.format('YYYY-MM-DD HH:mm')} (Jaicós/PI).
+    
+    CONTEXTO (Eventos próximos):
+    {context_str}
 
-    REGRAS:
-    - Responder APENAS JSON plano.
-    - Se for agendar: acao="create", titulo, data_inicio (ISO).
-    - Se for apagar: acao="delete", event_id (pegue o ID correto no contexto).
-    - Se for listar: acao="read".
+    REGRAS TÉCNICAS:
+    - Retorne APENAS JSON.
+    - Criar: {{"acao": "create", "titulo": "...", "data": "ISO"}}
+    - Apagar: {{"acao": "delete", "id": "ID_DO_CONTEXTO"}}
+    - Listar: {{"acao": "read"}}
+    - Conversar: {{"acao": "chat", "msg": "..."}}
     """
     try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
                 "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}],
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_input}],
                 "response_format": {"type": "json_object"}
-            }, timeout=15
-        )
+            }, timeout=10)
         return res.json()['choices'][0]['message']['content']
-    except: return json.dumps({"acao": "chat", "resposta_amigavel": "Me enrolei aqui... pode falar de novo? 🥺"})
+    except: return json.dumps({"acao": "chat", "msg": "Tive um erro, Kauan. 😕"})
 
-# ==========================================
-# 5. HANDLER PRINCIPAL (FLUXO IA)
-# ==========================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- TELEGRAM HANDLER ---
+async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
+    
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     
-    user_text = update.message.text
-    if update.message.voice:
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        path = f"v_{update.message.voice.file_id}.ogg"
-        await voice_file.download_to_drive(path)
-        user_text = await transcribe_audio(path)
-        os.remove(path)
+    # Busca contexto ampliado (7 dias antes e depois) para a IA não se perder em datas
+    agora = arrow.now('America/Sao_Paulo')
+    eventos = list_evs(agora.shift(days=-7).floor('day').isoformat(), agora.shift(days=7).ceil('day').isoformat())
+    ctx_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} | {e.get('summary')}" for e in eventos])
 
-    # Busca janela de 3 dias para contexto da IA
-    hoje = arrow.now('America/Sao_Paulo')
-    eventos_contexto = list_events(hoje.shift(days=-1).floor('day').isoformat(), hoje.shift(days=1).ceil('day').isoformat())
-    contexto_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM')} | {e.get('summary')}" for e in eventos_contexto])
-
-    raw_res = await ask_lumi(user_text, contexto_str)
+    raw = await ask_lumi(update.message.text or "oi", ctx_str)
     try:
-        data = json.loads(raw_res)
+        data = json.loads(raw)
         acao = data.get("acao")
-        resposta = data.get("resposta_amigavel", "Certinho!")
         
         if acao == "create":
-            ev = create_event(data.get("titulo"), data.get("data_inicio"))
-            if ev: resposta += f"\n\n✨ [Evento Criado!]({ev.get('htmlLink')})"
-        elif acao == "delete" and data.get("event_id"):
-            if delete_event(data.get("event_id")):
-                resposta = "🗑️ Prontinho! Já removi esse compromisso para você. ✨"
+            res = create_ev(data.get("titulo"), data.get("data"))
+            msg = f"✅ Criado: *{data.get('titulo')}* para às {arrow.get(data.get('data')).format('HH:mm')}! ✨" if res else "Erro ao criar. ❌"
+        
+        elif acao == "delete":
+            msg = "🗑️ Evento removido com sucesso! ✨" if delete_ev(data.get("id")) else "Não achei esse evento para apagar. 🧐"
+            
         elif acao == "read":
-            lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos_contexto])
-            resposta += f"\n\n{lista or 'Sua agenda está limpa! 🌸'}"
+            # Listagem bonita direto via código
+            if not eventos: msg = "Sua agenda está vazia nos próximos dias! 🌸"
+            else:
+                hoje_str = agora.format('DD/MM')
+                lista = []
+                for e in eventos:
+                    dt = arrow.get(e['start'].get('dateTime')).format('DD/MM')
+                    hr = arrow.get(e['start'].get('dateTime')).format('HH:mm')
+                    prefixo = "📍 Hoje" if dt == hoje_str else f"📅 {dt}"
+                    lista.append(f"{prefixo} - *{hr}*: {e.get('summary')}")
+                msg = "📋 *Sua Agenda:*\n\n" + "\n".join(lista)
+        
+        else: msg = data.get("msg", "Oi Kauan! Como posso ajudar na sua agenda hoje? 🌸")
 
-        await update.message.reply_text(resposta, parse_mode='Markdown', disable_web_page_preview=True)
+        await update.message.reply_text(msg, parse_mode='Markdown')
     except:
-        await update.message.reply_text("Ops, tive um erro de processamento. 😕")
+        await update.message.reply_text("Me enrolei aqui. Pode repetir? 😕")
 
-# ==========================================
-# 6. SERVER & INICIALIZAÇÃO
-# ==========================================
+# --- INFRA ---
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-# Configuração de Handlers
-bot_app.add_handler(CommandHandler("start", start_command))
-bot_app.add_handler(CommandHandler("hoje", hoje_command))
-bot_app.add_handler(CommandHandler("amanha", amanha_command))
-bot_app.add_handler(CommandHandler("limpar", limpar_hoje))
-bot_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot_app.initialize()
-    await bot_app.start()
-    yield
-    await bot_app.stop()
+    await bot_app.initialize(); await bot_app.start(); yield; await bot_app.stop()
 
 app = FastAPI(lifespan=lifespan)
 @app.post("/webhook")
