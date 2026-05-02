@@ -1,4 +1,3 @@
-import google.generativeai as genai
 import os, json, arrow, requests
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -12,174 +11,111 @@ load_dotenv()
 
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Pega o ID do Kauan para segurança
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
-TZ = "America/Sao_Paulo"
-
-# Memória simples (último evento usado)
-MEMORY = {"last_event_id": None}
-
-# --- CALENDAR ---
+# --- CALENDAR ENGINE ---
 def get_calendar():
     try:
-        # Carrega o token das variáveis de ambiente da Render
         creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
         return build('calendar', 'v3', credentials=creds)
-    except:
-        return None
+    except: return None
 
 def create_ev(titulo, data_iso):
     service = get_calendar()
     if not service: return None
     try:
-        start = arrow.get(data_iso).to(TZ)
+        start = arrow.get(data_iso).replace(tzinfo='America/Sao_Paulo')
         event = {
             'summary': titulo,
-            'start': {'dateTime': start.isoformat(), 'timeZone': TZ},
-            'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ},
+            'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
         }
-        res = service.events().insert(calendarId='primary', body=event).execute()
-        MEMORY["last_event_id"] = res["id"]
-        return res
+        return service.events().insert(calendarId='primary', body=event).execute()
     except: return None
-
-def update_ev(eid, nova_data):
-    service = get_calendar()
-    if not service or not eid: return False
-    try:
-        event = service.events().get(calendarId='primary', eventId=eid).execute()
-        start = arrow.get(nova_data).to(TZ)
-        event['start'] = {'dateTime': start.isoformat(), 'timeZone': TZ}
-        event['end'] = {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ}
-        service.events().update(calendarId='primary', eventId=eid, body=event).execute()
-        return True
-    except: return False
 
 def delete_ev(eid):
     service = get_calendar()
-    if not service or not eid: return False
+    if not service: return False
     try:
         service.events().delete(calendarId='primary', eventId=eid).execute()
         return True
     except: return False
 
-def list_evs():
+def list_evs(t_min, t_max):
     service = get_calendar()
     if not service: return []
     try:
-        now = arrow.now(TZ)
-        events = service.events().list(
-            calendarId='primary',
-            timeMin=now.floor('day').isoformat(),
-            timeMax=now.shift(days=7).ceil('day').isoformat(),
-            singleEvents=True,
-            orderBy='startTime'
-        ).execute().get('items', [])
-        return events
+        return service.events().list(calendarId='primary', timeMin=t_min, timeMax=t_max, singleEvents=True, orderBy='startTime').execute().get('items', [])
     except: return []
-# Configure sua chave (certifique-se de ter a GEMINI_API_KEY no .env ou Render)
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-async def ask_lumi(user_input, context_list):
-    agora = arrow.now(TZ)
+# --- AI ENGINE ---
+async def ask_lumi(user_input, context_str):
+    agora = arrow.now('America/Sao_Paulo')
+    system = f"""
+    Nome: Lumi. Papel: Assistente de Agenda.
+    Agora: {agora.format('YYYY-MM-DD HH:mm')} (Jaicós/PI).
     
-    # Formata a lista de eventos para a IA entender
-    ctx_text = "\n".join([
-        f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}"
-        for i, e in enumerate(context_list)
-    ])
+    CONTEXTO (Eventos próximos):
+    {context_str}
 
-    # O prompt permanece estruturado para garantir o retorno em JSON
-    prompt = f"""
-    Você é a Lumi, assistente de agenda do Kauan.
-    Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
-
-    Agenda Atual:
-    {ctx_text}
-
-    REGRAS:
-    - Retorne APENAS JSON puro.
-    - Para update/delete, use o "index" da lista.
-    - Se o usuário quiser alterar algo recém-citado sem index na lista, use "index": null.
-
-    FORMATOS JSON:
-    Criar: {{"acao":"create","titulo":"...","data":"ISO"}}
-    Atualizar: {{"acao":"update","index":0,"data":"ISO"}}
-    Deletar: {{"acao":"delete","index":0}}
-    Listar: {{"acao":"read"}}
-    Conversa: {{"acao":"chat","msg":"..."}}
+    REGRAS TÉCNICAS:
+    - Retorne APENAS JSON.
+    - Criar: {{"acao": "create", "titulo": "...", "data": "ISO"}}
+    - Apagar: {{"acao": "delete", "id": "ID_DO_CONTEXTO"}}
+    - Listar: {{"acao": "read"}}
+    - Conversar: {{"acao": "chat", "msg": "..."}}
     """
-
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', 
-                                      generation_config={"response_mime_type": "application/json"})
-        
-        # O Gemini Flash é muito bom seguindo instruções de sistema
-        response = model.generate_content([prompt, user_input])
-        return response.text
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_input}],
+                "response_format": {"type": "json_object"}
+            }, timeout=10)
+        return res.json()['choices'][0]['message']['content']
+    except: return json.dumps({"acao": "chat", "msg": "Tive um erro, Kauan. 😕"})
 
-    except Exception as e:
-        print(f"Erro no Gemini: {e}")
-        return json.dumps({"acao": "chat", "msg": "Tive um soluço aqui no Gemini. 😕"})
-    
-# --- TELEGRAM ---
+# --- TELEGRAM HANDLER ---
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or update.effective_user.id != MEU_ID_TELEGRAM:
-        return
-
+    if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
+    
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    
+    agora = arrow.now('America/Sao_Paulo')
+    eventos = list_evs(agora.shift(days=-7).floor('day').isoformat(), agora.shift(days=7).ceil('day').isoformat())
+    ctx_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} | {e.get('summary')}" for e in eventos])
 
-    eventos = list_evs()
-    raw = await ask_lumi(update.message.text, eventos)
-
+    raw = await ask_lumi(update.message.text or "oi", ctx_str)
     try:
         data = json.loads(raw)
         acao = data.get("acao")
-
+        
         if acao == "create":
-            ev = create_ev(data["titulo"], data["data"])
-            msg = f"✅ *{data['titulo']}* criado! ✨" if ev else "Erro ao criar no Google ❌"
-
-        elif acao == "update":
-            idx = data.get("index")
-            # Lógica de memória: se index for nulo ou inválido, usa o último ID criado
-            if idx is None or not (0 <= idx < len(eventos)):
-                eid = MEMORY["last_event_id"]
-            else:
-                eid = eventos[idx]["id"]
-            
-            if eid:
-                ok = update_ev(eid, data["data"])
-                msg = f"🕒 Horário atualizado para {arrow.get(data['data']).format('HH:mm')}! ✨" if ok else "Erro ao atualizar no Google ❌"
-            else:
-                msg = "Não encontrei qual evento você quer alterar. 🧐"
-
+            res = create_ev(data.get("titulo"), data.get("data"))
+            msg = f"✅ Criado: *{data.get('titulo')}* para às {arrow.get(data.get('data')).format('HH:mm')}! ✨" if res else "Erro ao criar. ❌"
+        
         elif acao == "delete":
-            idx = data.get("index")
-            if idx is not None and (0 <= idx < len(eventos)):
-                eid = eventos[idx]["id"]
-                ok = delete_ev(eid)
-                msg = "🗑️ Evento removido com sucesso! ✨" if ok else "Erro ao deletar ❌"
-            else:
-                msg = "Não achei esse evento na lista para apagar. 🧐"
-
+            msg = "🗑️ Evento removido com sucesso! ✨" if delete_ev(data.get("id")) else "Não achei esse evento para apagar. 🧐"
+            
         elif acao == "read":
-            if not eventos:
-                msg = "Sua agenda está vazia nos próximos dias! 🌸"
+            if not eventos: msg = "Sua agenda está vazia nos próximos dias! 🌸"
             else:
-                linhas = ["📋 *Sua Agenda:*"]
+                hoje_str = agora.format('DD/MM')
+                lista = []
                 for e in eventos:
-                    dt = arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')
-                    linhas.append(f"📅 {dt} - {e.get('summary')}")
-                msg = "\n".join(linhas)
-
-        else:
-            msg = data.get("msg", "Como posso ajudar? 🌸")
+                    dt = arrow.get(e['start'].get('dateTime')).format('DD/MM')
+                    hr = arrow.get(e['start'].get('dateTime')).format('HH:mm')
+                    prefixo = "📍 Hoje" if dt == hoje_str else f"📅 {dt}"
+                    lista.append(f"{prefixo} - *{hr}*: {e.get('summary')}")
+                msg = "📋 *Sua Agenda:*\n\n" + "\n".join(lista)
+        
+        else: msg = data.get("msg", "Oi Kauan! Como posso ajudar na sua agenda hoje? 🌸")
 
         await update.message.reply_text(msg, parse_mode='Markdown')
-
-    except Exception as e:
-        await update.message.reply_text(f"Ocorreu um erro: {str(e)}")
+    except:
+        await update.message.reply_text("Me enrolei aqui. Pode repetir? 😕")
 
 # --- INFRA ---
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -187,23 +123,21 @@ bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await bot_app.initialize()
-    await bot_app.start()
-    yield
-    await bot_app.stop()
+    await bot_app.initialize(); await bot_app.start(); yield; await bot_app.stop()
 
 app = FastAPI(lifespan=lifespan)
 
+# NOVO: Rota Raiz para evitar erro 404 nos logs da Render
 @app.get("/")
 async def root():
-    return {"status": "Lumi online e operante! 🌸"}
+    return {"status": "Lumi Online e Operante! 🌸"}
 
-# Rota de segurança para capturar Webhooks com caracteres extras
+# NOVO: Webhook flexível que aceita o link mesmo com erros de caracteres
 @app.post("/webhook{full_path:path}")
 async def webhook(request: Request, full_path: str = ""):
     try:
         data = await request.json()
         await bot_app.process_update(Update.de_json(data, bot_app.bot))
         return {"ok": True}
-    except:
-        return {"ok": False}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}

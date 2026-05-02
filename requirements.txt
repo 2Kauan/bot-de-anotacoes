@@ -8,4 +8,3 @@ requests
 python-dotenv
 arrow
 loguru
-google-generativeai
