@@ -11,6 +11,7 @@ load_dotenv()
 
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Pega o ID do Kauan para segurança
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
 # --- CALENDAR ENGINE ---
@@ -82,7 +83,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     
-    # Busca contexto ampliado (7 dias antes e depois) para a IA não se perder em datas
     agora = arrow.now('America/Sao_Paulo')
     eventos = list_evs(agora.shift(days=-7).floor('day').isoformat(), agora.shift(days=7).ceil('day').isoformat())
     ctx_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} | {e.get('summary')}" for e in eventos])
@@ -100,7 +100,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = "🗑️ Evento removido com sucesso! ✨" if delete_ev(data.get("id")) else "Não achei esse evento para apagar. 🧐"
             
         elif acao == "read":
-            # Listagem bonita direto via código
             if not eventos: msg = "Sua agenda está vazia nos próximos dias! 🌸"
             else:
                 hoje_str = agora.format('DD/MM')
@@ -127,8 +126,18 @@ async def lifespan(app: FastAPI):
     await bot_app.initialize(); await bot_app.start(); yield; await bot_app.stop()
 
 app = FastAPI(lifespan=lifespan)
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    await bot_app.process_update(Update.de_json(data, bot_app.bot))
-    return {"ok": True}
+
+# NOVO: Rota Raiz para evitar erro 404 nos logs da Render
+@app.get("/")
+async def root():
+    return {"status": "Lumi Online e Operante! 🌸"}
+
+# NOVO: Webhook flexível que aceita o link mesmo com erros de caracteres
+@app.post("/webhook{full_path:path}")
+async def webhook(request: Request, full_path: str = ""):
+    try:
+        data = await request.json()
+        await bot_app.process_update(Update.de_json(data, bot_app.bot))
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
