@@ -103,7 +103,7 @@ REGRAS:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
-                "model": "llama-3.1-70b-versatile",
+                "model": "llama-3.1-8b-instant",
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_input}
