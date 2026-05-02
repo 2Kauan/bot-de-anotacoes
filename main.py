@@ -12,96 +12,72 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 # ==========================================
-# 1. CONFIGURAÇÕES GERAIS
+# 1. CONFIGURAÇÕES E MEMÓRIA
 # ==========================================
 load_dotenv()
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-
-# ITEM 4: Segurança (Coloque seu ID do Telegram na Railway)
-# Dica: Se não souber seu ID, mande uma mensagem e veja o log "BLOQUEADO"
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
+# Mapeamento amigável de cores para o Google Calendar
+CORES_GOOGLE = {
+    "lavanda": "1", "verde": "10", "azul": "7", "amarelo": "5", 
+    "laranja": "6", "vermelho": "11", "rosa": "4", "roxo": "3", "cinza": "8"
+}
+
+# Categorias em memória (Serão atualizadas via chat)
+MINHAS_CATEGORIAS = {
+    "Estudo": "1", "Academia": "10", "Trabalho": "7"
+}
+
 # ==========================================
-# 2. INTEGRAÇÃO GOOGLE CALENDAR
+# 2. INTEGRAÇÃO CALENDAR
 # ==========================================
 def get_calendar_service():
     token_json = os.getenv("GOOGLE_TOKEN")
     try:
-        if not token_json: return None
-        creds_dict = json.loads(token_json)
-        creds = Credentials.from_authorized_user_info(creds_dict)
+        creds = Credentials.from_authorized_user_info(json.loads(token_json))
         return build('calendar', 'v3', credentials=creds)
-    except Exception as e:
-        print(f"Erro Calendar: {e}")
-        return None
+    except: return None
 
-def _sync_list_events():
-    service = get_calendar_service()
-    if not service: return []
-    now = datetime.datetime.utcnow().isoformat() + 'Z'
-    try:
-        events_result = service.events().list(
-            calendarId='primary', timeMin=now, maxResults=10, 
-            singleEvents=True, orderBy='startTime'
-        ).execute()
-        return events_result.get('items', [])
-    except:
-        return []
-
-def _sync_create_event(titulo, data_iso):
+def _sync_create_event(titulo, data_iso, color_id=None):
     service = get_calendar_service()
     if not service: return None
     dt = datetime.datetime.fromisoformat(data_iso)
     event = {
         'summary': titulo,
-        'description': 'Criado via Assistente Inteligente',
+        'colorId': color_id,
         'start': {'dateTime': dt.isoformat(), 'timeZone': 'America/Sao_Paulo'},
         'end': {'dateTime': (dt + datetime.timedelta(hours=1)).isoformat(), 'timeZone': 'America/Sao_Paulo'},
     }
-    # Retorna o evento criado para pegarmos o link
     return service.events().insert(calendarId='primary', body=event).execute()
 
-def _sync_delete_event(event_id):
-    service = get_calendar_service()
-    if not service: return False
-    try:
-        service.events().delete(calendarId='primary', eventId=event_id).execute()
-        return True
-    except:
-        return False
-
-async def calendar_action(action, **kwargs):
-    if action == "list": return await asyncio.to_thread(_sync_list_events)
-    elif action == "create": return await asyncio.to_thread(_sync_create_event, kwargs.get("titulo"), kwargs.get("data"))
-    elif action == "delete": return await asyncio.to_thread(_sync_delete_event, kwargs.get("id"))
-
 # ==========================================
-# 3. MOTOR DE IA (GROQ 3.1)
+# 3. MOTOR DE IA (GESTÃO NATURAL)
 # ==========================================
-async def process_intent_with_ai(prompt_text, current_events):
+async def process_intent_with_ai(prompt_text):
     fuso = datetime.timezone(datetime.timedelta(hours=-3))
     agora = datetime.datetime.now(fuso)
     
-    eventos_simplificados = [
-        {"id": e['id'], "titulo": e.get('summary'), "inicio": e['start'].get('dateTime')} 
-        for e in current_events
-    ]
-    
     prompt_sistema = f"""
-    Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}. Local: Jaicós, PI.
-    Agenda: {json.dumps(eventos_simplificados, ensure_ascii=False)}
-    Retorne APENAS JSON:
+    Hoje: {agora.strftime("%Y-%m-%d %H:%M:%S")}. Local: Jaicós, PI.
+    Categorias Atuais: {json.dumps(MINHAS_CATEGORIAS, ensure_ascii=False)}
+    Cores Disponíveis: {list(CORES_GOOGLE.keys())}
+
+    Responda APENAS JSON:
     {{
-        "acao": "create"|"read"|"delete"|"chat", 
-        "resposta_amigavel": "texto curto com emojis", 
-        "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}
+        "acao": "create"|"read"|"delete"|"config"|"chat", 
+        "resposta_amigavel": "...", 
+        "parametros": {{
+            "titulo": "...", "data_inicio": "ISO", "color_id": "ID",
+            "config_tipo": "add"|"del"|"list",
+            "cat_nome": "...", "cat_cor_nome": "..."
+        }}
     }}
-    Use Markdown para a resposta_amigavel (ex: *texto*).
+    Se o usuário quiser criar/mudar categoria, use acao='config'.
     """
 
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "system", "content": prompt_sistema}, {"role": "user", "content": prompt_text}],
@@ -109,68 +85,60 @@ async def process_intent_with_ai(prompt_text, current_events):
     }
 
     try:
-        response = await asyncio.to_thread(requests.post, url, json=payload, headers=headers, timeout=10)
-        res_json = response.json()
-        texto_ia = res_json['choices'][0]['message']['content']
-        return json.loads(texto_ia)
-    except Exception as e:
-        print(f"Erro IA: {e}")
-        return {"acao": "chat", "resposta_amigavel": "❌ Erro ao processar intenção.", "parametros": {}}
+        response = await asyncio.to_thread(requests.post, url, json=payload, headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=10)
+        return response.json()['choices'][0]['message']['content']
+    except: return "{}"
 
 # ==========================================
-# 4. CONTROLLER (UX + SEGURANÇA)
+# 4. HANDLER PRINCIPAL
 # ==========================================
 async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
-    
-    # --- ITEM 4: WHITELIST DE SEGURANÇA ---
-    user_id = update.effective_user.id
-    if user_id != MEU_ID_TELEGRAM:
-        print(f"⚠️ ACESSO BLOQUEADO: Usuário {user_id} tentou usar o bot.")
-        # Se for a primeira vez, você pode remover o return para descobrir seu ID no log
-        return 
+    if update.effective_user.id != MEU_ID_TELEGRAM: return
 
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-        
-        # 1. Contexto e IA
-        eventos = await calendar_action("list")
-        decisao = await process_intent_with_ai(update.message.text, eventos)
+        res_raw = await process_intent_with_ai(update.message.text)
+        decisao = json.loads(res_raw)
         
         acao = decisao.get("acao")
         params = decisao.get("parametros", {})
-        msg = decisao.get("resposta_amigavel", "Ok!")
+        msg = decisao.get("resposta_amigavel", "Processado!")
 
-        # 2. Execução e Melhoria Visual (ITEM 1)
-        if acao == "create":
-            evento_criado = await calendar_action("create", titulo=params.get("titulo"), data=params.get("data_inicio"))
-            if evento_criado:
-                link = evento_criado.get('htmlLink')
-                msg += f"\n\n🔗 [Ver no Google Calendar]({link})"
-        
-        elif acao == "delete":
-            for eid in params.get("event_ids", []):
-                await calendar_action("delete", id=eid)
-            msg = f"🗑️ *Sucesso:* Compromisso removido da agenda."
+        # --- LÓGICA DE CONFIGURAÇÃO NATURAL ---
+        if acao == "config":
+            tipo = params.get("config_tipo")
+            nome = params.get("cat_nome")
+            cor_nome = params.get("cat_cor_nome", "").lower()
 
-        elif acao == "read":
-            if not eventos:
-                msg = "📅 Sua agenda está livre por enquanto!"
-            else:
-                msg = "📅 *Próximos Compromissos:*\n\n"
-                for e in eventos:
-                    inicio = e['start'].get('dateTime', e['start'].get('date'))
-                    dt = datetime.datetime.fromisoformat(inicio.replace('Z', '+00:00'))
-                    msg += f"• *{dt.strftime('%d/%m - %H:%M')}*: {e.get('summary')}\n"
+            if tipo == "add":
+                id_cor = CORES_GOOGLE.get(cor_nome, "1")
+                MINHAS_CATEGORIAS[nome] = id_cor
+                msg = f"✅ Categoria *{nome}* criada com a cor *{cor_nome}*!"
+            elif tipo == "del":
+                MINHAS_CATEGORIAS.pop(nome, None)
+                msg = f"🗑️ Categoria *{nome}* removida."
+            elif tipo == "list":
+                lista = "\n".join([f"• {k}" for k in MINHAS_CATEGORIAS.keys()])
+                msg = f"🎨 *Suas Categorias:*\n{lista}"
 
-        await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
-        
+        # --- LÓGICA DE CRIAÇÃO ---
+        elif acao == "create":
+            # Se a IA não mandou color_id mas o título tem a categoria, nós forçamos
+            color_id = params.get("color_id")
+            evento = await asyncio.to_thread(_sync_create_event, params.get("titulo"), params.get("data_inicio"), color_id)
+            link = evento.get('htmlLink')
+            msg += f"\n\n🔗 [Ver no Google]({link})"
+
+        await update.message.reply_text(msg, parse_mode='Markdown')
+
     except Exception as e:
-        print(f"Erro Controller: {e}")
-        await update.message.reply_text("❌ Tive um problema ao sincronizar.")
+        print(f"Erro: {e}")
+        await update.message.reply_text("❌ Tive um problema ao processar.")
 
 # ==========================================
-# 5. FASTAPI & LIFESPAN
+# 5. SETUP FASTAPI
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update))
@@ -179,21 +147,12 @@ bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_updat
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
-    print(f"🚀 Bot Protegido Online. Whitelist: {MEU_ID_TELEGRAM}")
     yield
     await bot_app.stop()
-    await bot_app.shutdown()
 
 app = FastAPI(lifespan=lifespan)
-
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
-    update = Update.de_json(data, bot_app.bot)
-    asyncio.create_task(bot_app.process_update(update))
+    await bot_app.process_update(Update.de_json(data, bot_app.bot))
     return {"status": "ok"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
