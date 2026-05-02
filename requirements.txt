@@ -7,5 +7,4 @@ google-auth-oauthlib
 requests
 python-dotenv
 arrow
-pydantic
 loguru
