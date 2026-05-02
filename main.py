@@ -8,7 +8,7 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes, CommandHandler
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
@@ -22,27 +22,13 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
 # ==========================================
-# 2. FERRAMENTAS DE AGENDA (CRUD SIMPLIFICADO)
+# 2. FERRAMENTAS DE AGENDA (CRUD)
 # ==========================================
 def get_calendar():
     try:
         token_data = os.getenv("GOOGLE_TOKEN")
         creds = Credentials.from_authorized_user_info(json.loads(token_data))
         return build('calendar', 'v3', credentials=creds)
-    except: return None
-
-def create_event(titulo, data_iso):
-    service = get_calendar()
-    if not service: return None
-    try:
-        # Forçamos o fuso de Jaicós e duração de 1h
-        start = arrow.get(data_iso).replace(tzinfo='America/Sao_Paulo')
-        event = {
-            'summary': titulo,
-            'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
-            'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
-        }
-        return service.events().insert(calendarId='primary', body=event).execute()
     except: return None
 
 def list_events(time_min, time_max):
@@ -56,6 +42,19 @@ def list_events(time_min, time_max):
         return res.get('items', [])
     except: return []
 
+def create_event(titulo, data_iso):
+    service = get_calendar()
+    if not service: return None
+    try:
+        start = arrow.get(data_iso).replace(tzinfo='America/Sao_Paulo')
+        event = {
+            'summary': titulo,
+            'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
+        }
+        return service.events().insert(calendarId='primary', body=event).execute()
+    except: return None
+
 def delete_event(event_id):
     service = get_calendar()
     if not service: return False
@@ -65,7 +64,46 @@ def delete_event(event_id):
     except: return False
 
 # ==========================================
-# 3. ÁUDIO (WHISPER)
+# 3. COMANDOS DIRETOS (SEM IA - 100% SEGURO)
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🌸 *Lumi Online!* Como posso ajudar, Kauan?\n\n"
+        "🚀 *Comandos Rápidos:*\n"
+        "/hoje - Ver sua agenda de hoje\n"
+        "/amanha - Ver sua agenda de amanhã\n"
+        "/limpar - Apagar TUDO de hoje\n\n"
+        "Ou pode me mandar áudio ou texto que eu uso minha inteligência! ✨"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+async def hoje_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hoje = arrow.now('America/Sao_Paulo')
+    eventos = list_events(hoje.floor('day').isoformat(), hoje.ceil('day').isoformat())
+    if not eventos:
+        return await update.message.reply_text("Agenda limpinha para hoje! 🌸")
+    lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos])
+    await update.message.reply_text(f"📅 *Hoje em Jaicós:*\n\n{lista}", parse_mode='Markdown')
+
+async def amanha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amanha = arrow.now('America/Sao_Paulo').shift(days=1)
+    eventos = list_events(amanha.floor('day').isoformat(), amanha.ceil('day').isoformat())
+    if not eventos:
+        return await update.message.reply_text("Nada agendado para amanhã ainda! ✨")
+    lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos])
+    await update.message.reply_text(f"📅 *Amanhã:*\n\n{lista}", parse_mode='Markdown')
+
+async def limpar_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    hoje = arrow.now('America/Sao_Paulo')
+    eventos = list_events(hoje.floor('day').isoformat(), hoje.ceil('day').isoformat())
+    if not eventos:
+        return await update.message.reply_text("Nada para limpar hoje! 😂")
+    for e in eventos:
+        delete_event(e['id'])
+    await update.message.reply_text("🗑️ TUDO limpo! Sua agenda de hoje foi zerada. ✨")
+
+# ==========================================
+# 4. INTELIGÊNCIA ARTIFICIAL (VOZ E TEXTO)
 # ==========================================
 async def transcribe_audio(file_path):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -77,26 +115,19 @@ async def transcribe_audio(file_path):
         return response.json().get("text", "")
     except: return ""
 
-# ==========================================
-# 4. INTELIGÊNCIA DA LUMI (PROMPT ENXUTO)
-# ==========================================
-async def ask_lumi(user_input, agenda_context="Nenhum evento"):
+async def ask_lumi(user_input, context_str):
     agora = arrow.now('America/Sao_Paulo')
-    
-    # Prompt simplificado para o modelo 8B não se perder
     system_prompt = f"""
-    Nome: Lumi. Papel: Assistente do Kauan em Jaicós, PI.
-    Hoje: {agora.format('DD/MM/YYYY HH:mm')}.
-    
-    AGENDA ATUAL: {agenda_context}
+    Nome: Lumi. Assistente do Kauan em Jaicós, PI.
+    Agora: {agora.format('DD/MM/YYYY HH:mm')}.
+    AGENDA RECENTE (Ontem a Amanhã): {context_str}
 
     REGRAS:
-    - Para AGENDAR: use acao="create", forneça titulo e data_inicio (ISO).
-    - Para LISTAR: use acao="read".
-    - Para APAGAR: use acao="delete" e forneça o event_id.
-    - Seja carinhosa, use emojis e responda em JSON plano.
+    - Responder APENAS JSON plano.
+    - Se for agendar: acao="create", titulo, data_inicio (ISO).
+    - Se for apagar: acao="delete", event_id (pegue o ID correto no contexto).
+    - Se for listar: acao="read".
     """
-
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -108,18 +139,15 @@ async def ask_lumi(user_input, agenda_context="Nenhum evento"):
             }, timeout=15
         )
         return res.json()['choices'][0]['message']['content']
-    except:
-        return json.dumps({"acao": "chat", "resposta_amigavel": "Desculpa Kauan, me perdi aqui... pode falar de novo? 🥺"})
+    except: return json.dumps({"acao": "chat", "resposta_amigavel": "Me enrolei aqui... pode falar de novo? 🥺"})
 
 # ==========================================
-# 5. HANDLER PRINCIPAL
+# 5. HANDLER PRINCIPAL (FLUXO IA)
 # ==========================================
-async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     
-    # Lida com Voz ou Texto
     user_text = update.message.text
     if update.message.voice:
         voice_file = await context.bot.get_file(update.message.voice.file_id)
@@ -127,15 +155,13 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await voice_file.download_to_drive(path)
         user_text = await transcribe_audio(path)
         os.remove(path)
-        if not user_text: return await update.message.reply_text("Não consegui te ouvir... 🎙️")
 
-    # Busca eventos do dia para contexto
+    # Busca janela de 3 dias para contexto da IA
     hoje = arrow.now('America/Sao_Paulo')
-    eventos = list_events(hoje.floor('day').isoformat(), hoje.ceil('day').isoformat())
-    contexto = "\n".join([f"ID: {e['id']} | {e.get('summary')}" for e in eventos])
+    eventos_contexto = list_events(hoje.shift(days=-1).floor('day').isoformat(), hoje.shift(days=1).ceil('day').isoformat())
+    contexto_str = "\n".join([f"ID: {e['id']} | Data: {arrow.get(e['start'].get('dateTime')).format('DD/MM')} | {e.get('summary')}" for e in eventos_contexto])
 
-    # IA Decide
-    raw_res = await ask_lumi(user_text, contexto)
+    raw_res = await ask_lumi(user_text, contexto_str)
     try:
         data = json.loads(raw_res)
         acao = data.get("acao")
@@ -144,27 +170,28 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if acao == "create":
             ev = create_event(data.get("titulo"), data.get("data_inicio"))
             if ev: resposta += f"\n\n✨ [Evento Criado!]({ev.get('htmlLink')})"
-        
-        elif acao == "delete":
+        elif acao == "delete" and data.get("event_id"):
             if delete_event(data.get("event_id")):
-                resposta = "🗑️ Pronto! Compromisso removido. ✨"
-        
+                resposta = "🗑️ Prontinho! Já removi esse compromisso para você. ✨"
         elif acao == "read":
-            if not eventos:
-                resposta += "\n\nSua agenda está livre hoje! 🌸"
-            else:
-                lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos])
-                resposta += f"\n\n{lista}"
+            lista = "\n".join([f"⏰ *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos_contexto])
+            resposta += f"\n\n{lista or 'Sua agenda está limpa! 🌸'}"
 
         await update.message.reply_text(resposta, parse_mode='Markdown', disable_web_page_preview=True)
     except:
-        await update.message.reply_text("Tive um erro de processamento, Kauan. 😕")
+        await update.message.reply_text("Ops, tive um erro de processamento. 😕")
 
 # ==========================================
-# 6. SERVIDOR
+# 6. SERVER & INICIALIZAÇÃO
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-bot_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_update))
+
+# Configuração de Handlers
+bot_app.add_handler(CommandHandler("start", start_command))
+bot_app.add_handler(CommandHandler("hoje", hoje_command))
+bot_app.add_handler(CommandHandler("amanha", amanha_command))
+bot_app.add_handler(CommandHandler("limpar", limpar_hoje))
+bot_app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
