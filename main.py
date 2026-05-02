@@ -1,3 +1,4 @@
+import google.generativeai as genai
 import os, json, arrow, requests
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -76,46 +77,51 @@ def list_evs():
         ).execute().get('items', [])
         return events
     except: return []
+# Configure sua chave (certifique-se de ter a GEMINI_API_KEY no .env ou Render)
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# --- IA ---
 async def ask_lumi(user_input, context_list):
     agora = arrow.now(TZ)
+    
+    # Formata a lista de eventos para a IA entender
     ctx_text = "\n".join([
         f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}"
         for i, e in enumerate(context_list)
     ])
 
-    system = f"""
-Você é a Lumi, assistente de agenda do Kauan.
-Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
+    # O prompt permanece estruturado para garantir o retorno em JSON
+    prompt = f"""
+    Você é a Lumi, assistente de agenda do Kauan.
+    Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
 
-Agenda Atual:
-{ctx_text}
+    Agenda Atual:
+    {ctx_text}
 
-REGRAS:
-- Retorne APENAS JSON.
-- Para update/delete, use o "index" da lista acima.
-- Se o usuário quiser alterar algo que acabou de ser citado ou criado, e você não tiver index, envie "index": null.
-"""
+    REGRAS:
+    - Retorne APENAS JSON puro.
+    - Para update/delete, use o "index" da lista.
+    - Se o usuário quiser alterar algo recém-citado sem index na lista, use "index": null.
+
+    FORMATOS JSON:
+    Criar: {{"acao":"create","titulo":"...","data":"ISO"}}
+    Atualizar: {{"acao":"update","index":0,"data":"ISO"}}
+    Deletar: {{"acao":"delete","index":0}}
+    Listar: {{"acao":"read"}}
+    Conversa: {{"acao":"chat","msg":"..."}}
+    """
 
     try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={
-                "model": "llama-3.1-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_input}
-                ],
-                "response_format": {"type": "json_object"}
-            },
-            timeout=15
-        )
-        return res.json()['choices'][0]['message']['content']
-    except:
-        return json.dumps({"acao": "chat", "msg": "Erro na IA 😕"})
+        model = genai.GenerativeModel('gemini-1.5-flash', 
+                                      generation_config={"response_mime_type": "application/json"})
+        
+        # O Gemini Flash é muito bom seguindo instruções de sistema
+        response = model.generate_content([prompt, user_input])
+        return response.text
 
+    except Exception as e:
+        print(f"Erro no Gemini: {e}")
+        return json.dumps({"acao": "chat", "msg": "Tive um soluço aqui no Gemini. 😕"})
+    
 # --- TELEGRAM ---
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM:
