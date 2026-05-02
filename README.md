@@ -1,6 +1,6 @@
 # ✨ Lumi — Sua Assistente Pessoal Inteligente
 
-## 🌸 O que é a Lumi?
+## O que é a Lumi?
 A Lumi não é apenas um chatbot; ela é uma assistente pessoal de alto padrão com alma e personalidade. Desenvolvida para ser o braço direito do Kauan em sua jornada de produtividade, a Lumi combina a velocidade da Groq com a inteligência do Llama 3.1 e a organização do Google Calendar.
 
 Ela possui uma identidade feminina equilibrada: é gentil, expressiva e utiliza emojis para tornar a interação mais humana, mas mantém um foco inabalável em eficiência, clareza e estratégia.
