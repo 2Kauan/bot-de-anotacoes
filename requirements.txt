@@ -1,10 +1,12 @@
 fastapi
 uvicorn
-python-dotenv
-google-generativeai
 python-telegram-bot
 google-api-python-client
-google-auth-oauthlib
 google-auth-httplib2
-apscheduler
+google-auth-oauthlib
 requests
+python-dotenv
+apscheduler
+arrow
+pydantic
+loguru

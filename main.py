@@ -1,161 +1,169 @@
 import os
 import json
-import datetime
-import asyncio
+import arrow
 import requests
+from typing import Optional, List, Literal
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
+from pydantic import BaseModel, Field, ValidationError
+from loguru import logger
 from dotenv import load_dotenv
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-# ==========================================
-# 1. CONFIGURAÇÕES
-# ==========================================
 load_dotenv()
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 
 # ==========================================
-# 2. INTEGRAÇÃO GOOGLE CALENDAR
+# 1. MODELAGEM DE DADOS (PYDANTIC)
 # ==========================================
-def get_calendar_service():
+class LumiAction(BaseModel):
+    """Esquema rigoroso para a tomada de decisão da IA"""
+    acao: Literal["create", "read", "delete", "chat"]
+    resposta_amigavel: str = Field(..., description="Fala da Lumi com emojis e calor humano")
+    titulo: Optional[str] = None
+    data_inicio: Optional[str] = None
+    event_id: Optional[str] = None
+    color_id: Optional[str] = "1"
+
+# ==========================================
+# 2. CONFIGURAÇÕES & ESTADO
+# ==========================================
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
+CATEGORIAS = {"Estudo": "1", "Academia": "10", "Trabalho": "7", "Lazer": "5"}
+
+# ==========================================
+# 3. CORE DE CALENDÁRIO (ARROW + GOOGLE)
+# ==========================================
+def get_calendar():
     try:
         creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
         return build('calendar', 'v3', credentials=creds)
-    except: return None
+    except Exception as e:
+        logger.error(f"Falha na conexão Google: {e}")
+        return None
 
-def _sync_list_events(time_min=None, time_max=None):
-    service = get_calendar_service()
-    if not service: return []
-    try:
-        res = service.events().list(
-            calendarId='primary', timeMin=time_min, timeMax=time_max,
-            singleEvents=True, orderBy='startTime'
-        ).execute()
-        return res.get('items', [])
-    except: return []
-
-def _sync_delete_event(event_id):
-    service = get_calendar_service()
+def manage_event(action: LumiAction):
+    service = get_calendar()
     if not service: return False
-    try:
-        service.events().delete(calendarId='primary', eventId=event_id).execute()
-        return True
-    except: return False
 
-def _sync_create_event(titulo, data_iso, color_id=None):
-    service = get_calendar_service()
-    if not service: return None
     try:
-        dt_start = datetime.datetime.fromisoformat(data_iso.replace('Z', '-03:00'))
-        event = {
-            'summary': titulo,
-            'colorId': color_id if color_id else "1",
-            'start': {'dateTime': dt_start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
-            'end': {'dateTime': (dt_start + datetime.timedelta(hours=1)).isoformat(), 'timeZone': 'America/Sao_Paulo'},
-        }
-        return service.events().insert(calendarId='primary', body=event).execute()
-    except: return None
+        if action.acao == "create":
+            # Arrow garante precisão cirúrgica no fuso de Jaicós
+            start = arrow.get(action.data_inicio).replace(tzinfo='America/Sao_Paulo')
+            event = {
+                'summary': action.titulo,
+                'colorId': action.color_id if action.color_id in [str(i) for i in range(1,12)] else "1",
+                'start': {'dateTime': start.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+                'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': 'America/Sao_Paulo'},
+            }
+            return service.events().insert(calendarId='primary', body=event).execute()
+
+        if action.acao == "delete" and action.event_id:
+            service.events().delete(calendarId='primary', eventId=action.event_id).execute()
+            return True
+            
+        return None
+    except Exception as e:
+        logger.error(f"Erro na execução da agenda: {e}")
+        return None
 
 # ==========================================
-# 3. MOTOR LUMI (CÉREBRO COM TRAVA DE INTENÇÃO)
+# 4. INTELIGÊNCIA ARTIFICIAL (GROQ)
 # ==========================================
-async def process_with_lumi_brain(user_input, current_events):
-    fuso = datetime.timezone(datetime.timedelta(hours=-3))
-    agora = datetime.datetime.now(fuso)
+async def ask_lumi(prompt_user: str, context_events: list) -> LumiAction:
+    agora = arrow.now('America/Sao_Paulo')
     
-    # Passamos os eventos REAIS para ela saber o que apagar
-    agenda_contexto = [{"id": e['id'], "summary": e.get('summary'), "time": e['start'].get('dateTime')} for e in current_events]
+    # Contexto rico para evitar que ela "burreie"
+    agenda_view = [{"id": e['id'], "summary": e.get('summary'), "start": e['start'].get('dateTime')} for e in context_events]
 
-    prompt_sistema = f"""
-    Seu nome é Lumi. Assistente pessoal de Jaicós, PI.
-    Hoje é {agora.strftime("%d/%m/%Y %H:%M")}.
+    system_prompt = f"""
+    Seu nome é Lumi, assistente elite do Kauan em Jaicós, PI.
+    Hoje: {agora.format('dddd, DD/MM/YYYY HH:mm')}.
 
-    REGRAS CRÍTICAS DE INTENÇÃO:
-    1. Se o usuário usar verbos como "APAGAR", "REMOVER", "EXCLUIR" ou "CANCELAR", você deve obrigatoriamente usar acao='delete'.
-    2. Para APAGAR, escolha o 'event_id' correto da lista abaixo. Jamais crie um evento com o título "Apagar".
-    3. Para CRIAR, use acao='create'.
+    DIRETRIZES:
+    1. Se ele pedir para apagar/remover, identifique o ID na lista abaixo.
+    2. Se pedir para agendar, use ISO8601 com fuso -03:00.
+    3. Seja feminina, expressiva e use emojis.
     
-    AGENDA ATUAL DISPONÍVEL:
-    {json.dumps(agenda_contexto, ensure_ascii=False)}
+    CATEGORIAS: {json.dumps(CATEGORIAS)}
+    AGENDA RECENTE: {json.dumps(agenda_view)}
 
-    Retorne APENAS JSON:
-    {{
-        "acao": "create"|"read"|"delete"|"chat",
-        "resposta_amigavel": "...",
-        "parametros": {{"event_id": "ID_PARA_APAGAR", "titulo": "...", "data_inicio": "ISO", "color_id": "ID"}}
-    }}
+    Responda EXCLUSIVAMENTE em JSON seguindo o esquema Pydantic.
     """
-    
+
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={
                 "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "system", "content": prompt_sistema}, {"role": "user", "content": user_input}],
+                "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt_user}],
                 "response_format": {"type": "json_object"}
             },
-            headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=15
+            timeout=15
         )
-        return json.loads(res.json()['choices'][0]['message']['content'])
-    except:
-        return {"acao": "chat", "resposta_amigavel": "Tive um probleminha aqui, Kauan... pode repetir? 🥺"}
+        # Validação via Pydantic
+        return LumiAction.model_validate_json(res.json()['choices'][0]['message']['content'])
+    except Exception as e:
+        logger.error(f"Erro Groq/Pydantic: {e}")
+        return LumiAction(acao="chat", resposta_amigavel="Kauan, tive um pequeno soluço digital... pode repetir? 🌸")
 
 # ==========================================
-# 4. HANDLER PRINCIPAL
+# 5. HANDLER TELEGRAM (FLUXO PRINCIPAL)
 # ==========================================
-async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
 
+    logger.info(f"Mensagem recebida: {update.message.text}")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+
+    # Busca contexto preventivo
+    service = get_calendar()
+    hoje = arrow.now('America/Sao_Paulo').floor('day')
+    eventos_hoje = service.events().list(calendarId='primary', timeMin=hoje.isoformat()).execute().get('items', []) if service else []
+
+    # Processa IA
+    decisao = await ask_lumi(update.message.text, eventos_hoje)
     
-    # 1. Busca eventos do dia para dar contexto à Lumi
-    fuso = datetime.timezone(datetime.timedelta(hours=-3))
-    hoje_inicio = datetime.datetime.now(fuso).replace(hour=0, minute=0, second=0).isoformat() + 'Z'
-    hoje_fim = datetime.datetime.now(fuso).replace(hour=23, minute=59, second=59).isoformat() + 'Z'
-    eventos_dia = await asyncio.to_thread(_sync_list_events, hoje_inicio, hoje_fim)
-
-    # 2. Processa com a IA
-    decisao = await process_with_lumi_brain(update.message.text or "", eventos_dia)
-    acao = decisao.get("acao")
-    msg_lumi = decisao.get("resposta_amigavel", "")
-    params = decisao.get("parametros", {})
-
-    # 3. Execução
-    if acao == "delete":
-        eid = params.get("event_id")
-        if eid:
-            sucesso = await asyncio.to_thread(_sync_delete_event, eid)
-            msg_lumi = "🗑️ Prontinho, Kauan! Já apaguei esse compromisso para você. ✨" if sucesso else "Poxa, não consegui apagar esse evento... 😕"
+    # Execução
+    resultado = manage_event(decisao)
+    
+    final_msg = decisao.resposta_amigavel
+    if decisao.acao == "create" and resultado:
+        final_msg += f"\n\n✨ [Evento fixado na agenda!]({resultado.get('htmlLink')})"
+    elif decisao.acao == "read":
+        if not eventos_hoje:
+            final_msg += "\n\nNada agendado por enquanto! 🌸"
         else:
-            msg_lumi = "Kauan, você quer apagar qual evento exatamente? Não consegui identificar qual deles... 🧐"
+            lista = "\n".join([f"• *{arrow.get(e['start'].get('dateTime')).format('HH:mm')}* - {e.get('summary')}" for e in eventos_hoje])
+            final_msg += f"\n\n{lista}"
 
-    elif acao == "create":
-        ev = await asyncio.to_thread(_sync_create_event, params.get("titulo"), params.get("data_inicio"), params.get("color_id"))
-        if ev: msg_lumi += f"\n\n✨ [Evento criado!]({ev.get('htmlLink')})"
-
-    await update.message.reply_text(msg_lumi, parse_mode='Markdown', disable_web_page_preview=True)
+    await update.message.reply_text(final_msg, parse_mode='Markdown', disable_web_page_preview=True)
 
 # ==========================================
-# 5. SERVIDOR
+# 6. INFRAESTRUTURA (LIFESPAN & WEBHOOK)
 # ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
+    logger.info("Lumi Inicializada com sucesso!")
     yield
     await bot_app.stop()
 
 app = FastAPI(lifespan=lifespan)
+
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
     await bot_app.process_update(Update.de_json(data, bot_app.bot))
-    return {"status": "ok"}
+    return {"ok": True}
