@@ -15,7 +15,7 @@ from googleapiclient.discovery import build
 # 1. CONFIGURAÇÕES GERAIS
 # ==========================================
 load_dotenv()
-GROQ_KEY = os.getenv("GROQ_API_KEY") # Mude para a sua chave da Groq
+GROQ_KEY = os.getenv("GROQ_API_KEY")  # Adicione sua chave gsk_... na Railway
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 
 # ==========================================
@@ -42,7 +42,7 @@ def _sync_list_events():
             singleEvents=True, orderBy='startTime'
         ).execute()
         return events_result.get('items', [])
-    except Exception as e:
+    except:
         return []
 
 def _sync_create_event(titulo, data_iso):
@@ -71,9 +71,10 @@ async def calendar_action(action, **kwargs):
     elif action == "delete": return await asyncio.to_thread(_sync_delete_event, kwargs.get("id"))
 
 # ==========================================
-# 3. MOTOR DE IA (GROQ - MAIS RÁPIDO E ESTÁVEL)
+# 3. MOTOR DE IA (GROQ - ALTA VELOCIDADE)
 # ==========================================
 async def process_intent_with_ai(prompt_text, current_events):
+    # Fuso horário de Jaicós, Piauí (UTC-3)
     fuso = datetime.timezone(datetime.timedelta(hours=-3))
     agora = datetime.datetime.now(fuso)
     limite_48h = agora + datetime.timedelta(hours=48)
@@ -86,12 +87,13 @@ async def process_intent_with_ai(prompt_text, current_events):
     prompt_sistema = f"""
     Hoje é {agora.strftime("%Y-%m-%d %H:%M:%S")}. Local: Jaicós, PI.
     Agenda Atual: {json.dumps(eventos_simplificados, ensure_ascii=False)}
-    Retorne APENAS JSON puro: 
+    Retorne OBRIGATORIAMENTE APENAS um JSON puro (sem markdown): 
     {{
         "acao": "create"|"read"|"delete"|"chat", 
         "resposta_amigavel": "...", 
         "parametros": {{"titulo": "...", "data_inicio": "ISO", "event_ids": []}}
     }}
+    REGRA DE SEGURANÇA: Não delete eventos agendados para após {limite_48h.strftime("%Y-%m-%d %H:%M:%S")}.
     """
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -100,7 +102,7 @@ async def process_intent_with_ai(prompt_text, current_events):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama-3.3-70b-specdec", # Modelo de altíssima performance
+        "model": "llama3-8b-8192",  # Modelo mais estável para evitar erros de Rate Limit
         "messages": [
             {"role": "system", "content": prompt_sistema},
             {"role": "user", "content": prompt_text}
@@ -111,29 +113,56 @@ async def process_intent_with_ai(prompt_text, current_events):
     try:
         response = await asyncio.to_thread(requests.post, url, json=payload, headers=headers, timeout=10)
         res_json = response.json()
+        
+        if 'choices' not in res_json:
+            print(f"⚠️ Erro Groq: {res_json}")
+            raise Exception("Resposta sem choices")
+            
         texto_ia = res_json['choices'][0]['message']['content']
         return json.loads(texto_ia)
     except Exception as e:
-        print(f"Erro Groq: {e}")
-        return {"acao": "chat", "resposta_amigavel": "❌ Erro na Groq.", "parametros": {}}
+        print(f"❌ Falha no processamento da IA: {e}")
+        return {
+            "acao": "chat", 
+            "resposta_amigavel": "❌ Tive um problema ao processar seu pedido na Groq. Pode tentar de novo?", 
+            "parametros": {}
+        }
 
 # ==========================================
-# 4. CONTROLLER & FASTAPI (IGUAL ANTERIOR)
+# 4. CONTROLLER TELEGRAM
 # ==========================================
 async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-    eventos = await calendar_action("list")
-    decisao = await process_intent_with_ai(update.message.text, eventos)
     
-    if decisao.get("acao") == "create":
-        await calendar_action("create", titulo=decisao['parametros'].get("titulo"), data=decisao['parametros'].get("data_inicio"))
-    elif decisao.get("acao") == "delete":
-        for eid in decisao['parametros'].get("event_ids", []):
-            await calendar_action("delete", id=eid)
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        
+        # 1. Busca contexto atual da agenda
+        eventos = await calendar_action("list")
+        
+        # 2. IA decide o que fazer
+        decisao = await process_intent_with_ai(update.message.text, eventos)
+        
+        acao = decisao.get("acao")
+        params = decisao.get("parametros", {})
+        msg_resposta = decisao.get("resposta_amigavel", "Processado.")
 
-    await update.message.reply_text(decisao.get("resposta_amigavel"), parse_mode='Markdown')
+        # 3. Execução no Google Calendar
+        if acao == "create":
+            await calendar_action("create", titulo=params.get("titulo"), data=params.get("data_inicio"))
+        elif acao == "delete":
+            for eid in params.get("event_ids", []):
+                await calendar_action("delete", id=eid)
 
+        await update.message.reply_text(msg_resposta, parse_mode='Markdown')
+        
+    except Exception as e:
+        print(f"Erro no Controller: {e}")
+        await update.message.reply_text("❌ Ocorreu um erro interno. Verifique meus logs.")
+
+# ==========================================
+# 5. FASTAPI & LIFESPAN
+# ==========================================
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 
@@ -141,6 +170,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT, handle_update))
 async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
+    print("🚀 API Online na Railway (Motor Groq Ativo).")
     yield
     await bot_app.stop()
     await bot_app.shutdown()
@@ -149,10 +179,18 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, bot_app.bot)
-    asyncio.create_task(bot_app.process_update(update))
-    return {"status": "ok"}
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot_app.bot)
+        asyncio.create_task(bot_app.process_update(update))
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"Erro Webhook: {e}")
+        return {"status": "error"}
+
+@app.get("/")
+async def status():
+    return {"status": "online", "engine": "Groq Llama 3"}
 
 if __name__ == "__main__":
     import uvicorn
