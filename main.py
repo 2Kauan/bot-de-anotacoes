@@ -9,10 +9,11 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES OFICIAIS ---
 API_KEY = os.getenv("GROQ_API_KEY") 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
+# Fuso Horário Oficial de Brasília
 TZ = "America/Sao_Paulo"
 
 MEMORY = {"last_event": None}
@@ -32,10 +33,8 @@ def create_ev(titulo, data_iso):
     service = get_calendar()
     if not service: return None
     try:
-        # AJUSTE DE FUSO HORÁRIO:
-        # Interpretamos a data da IA como 'Local' e garantimos o ano de 2026
-        # O replace(tzinfo=TZ) evita que o sistema subtraia 3 horas indevidamente
-        start = arrow.get(data_iso).replace(year=2026, tzinfo=TZ)
+        # Força a interpretação da data como Horário de Brasília e ano 2026
+        start = arrow.get(data_iso).replace(year=2026).to(TZ)
         
         event = {
             'summary': titulo,
@@ -54,8 +53,8 @@ def update_ev(eid, nova_data):
     if not service or not eid: return None
     try:
         event = service.events().get(calendarId='primary', eventId=eid).execute()
-        # Aplica a mesma lógica de fuso horário no update
-        start = arrow.get(nova_data).replace(year=2026, tzinfo=TZ)
+        # Padronização para Brasília
+        start = arrow.get(nova_data).replace(year=2026).to(TZ)
         
         event['start'] = {'dateTime': start.isoformat(), 'timeZone': TZ}
         event['end'] = {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ}
@@ -78,6 +77,7 @@ def list_evs():
     service = get_calendar()
     if not service: return []
     try:
+        # Lista baseada no agora de Brasília
         now = arrow.now(TZ)
         return service.events().list(
             calendarId='primary',
@@ -88,17 +88,18 @@ def list_evs():
         ).execute().get('items', [])
     except: return []
 
-# ---------------- AI ENGINE ----------------
+# ---------------- AI ENGINE (BRASÍLIA) ----------------
 async def ask_lumi(user_input, context_list):
+    # Data/Hora atual oficial de Brasília
     agora = arrow.now(TZ)
     ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
 
     system = f"""
     Nome: Lumi. Assistente do Kauan.
-    Data de Hoje: {agora.format('DD/MM/YYYY')} ({agora.format('dddd')}). ANO ATUAL: 2026.
+    Horário Oficial (Brasília): {agora.format('DD/MM/YYYY HH:mm')} ({agora.format('dddd')}).
     Agenda Atual:
     {ctx}
-    REGRAS: Retorne JSON. Sempre use o ano de 2026.
+    REGRAS: Retorne JSON. Sempre use o ano de 2026 e o Horário de Brasília.
     JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
     """
     try:
@@ -128,13 +129,13 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if acao == "create":
             ev = create_ev(data["titulo"], data["data"])
-            msg = f"✅ *{ev['summary']}* criado!\n🔗 [Ver no Google]({ev['htmlLink']})" if ev else "Erro ao criar no Google."
+            msg = f"✅ *{ev['summary']}* criado no horário de Brasília!\n🔗 [Ver no Google]({ev['htmlLink']})" if ev else "Erro ao criar no Google."
 
         elif acao == "update":
             idx = data.get("index")
             eid = eventos[idx]["id"] if (idx is not None and idx < len(eventos)) else (MEMORY["last_event"]["id"] if MEMORY["last_event"] else None)
             res = update_ev(eid, data["data"])
-            msg = f"🕒 Horário atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento."
+            msg = f"🕒 Horário atualizado (Brasília)!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento."
 
         elif acao == "delete":
             idx = data.get("index")
@@ -148,11 +149,11 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not eventos: msg = "Sua agenda está vazia!"
             else:
                 linhas = [f"📅 {arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')} - {e.get('summary')}" for e in eventos]
-                msg = "📋 *Sua Agenda:*\n\n" + "\n".join(linhas)
+                msg = "📋 *Sua Agenda (Brasília):*\n\n" + "\n".join(linhas)
 
         await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
     except Exception as e:
-        await update.message.reply_text(f"Erro: {str(e)}")
+        await update.message.reply_text(f"Erro no processamento: {str(e)}")
 
 # ---------------- INFRA ----------------
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -165,7 +166,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-async def root(): return {"status": "Lumi Online"}
+async def root(): return {"status": "Lumi Online - Brasília Time"}
 
 @app.post("/webhook{full_path:path}")
 async def webhook(request: Request, full_path: str = ""):
