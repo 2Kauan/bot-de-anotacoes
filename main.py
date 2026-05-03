@@ -10,11 +10,15 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# Configurações
+# Configurações - Use o nome exato da variável na Render
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 TZ = "America/Sao_Paulo"
+
+# Log para verificar se a chave foi lida (vai aparecer nos logs da Render)
+if not GEMINI_KEY:
+    print("⚠️ AVISO: GEMINI_API_KEY não encontrada nas variáveis de ambiente!")
 
 # Memória e Configuração IA
 MEMORY = {"last_event": None}
@@ -108,7 +112,8 @@ async def ask_lumi(user_input, context_list):
         model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
         response = model.generate_content([prompt, user_input])
         return response.text
-    except:
+    except Exception as e:
+        print(f"❌ ERRO TÉCNICO NO GEMINI: {str(e)}")
         return json.dumps({"acao": "chat", "msg": "Tive um problema na conexão. Pode repetir?"})
 
 # ---------------- TELEGRAM ----------------
@@ -121,7 +126,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = classify_intent(text)
     eventos = list_evs()
 
-    # Atalho rápido para leitura sem IA
     if intent == "read":
         if not eventos:
             await update.message.reply_text("Sua agenda está vazia!")
