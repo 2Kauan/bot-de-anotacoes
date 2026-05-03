@@ -92,7 +92,7 @@ async def ask_lumi(user_input, context_list):
     ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
 
     prompt = f"""
-    Seu nome é Lumi, assistente do Kauan. Local: Jaicós/PI.
+    Seu nome é Lumi, assistente do Kauan.
     Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
     
     Agenda Atual:
