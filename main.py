@@ -10,17 +10,12 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# Configurações - Use o nome exato da variável na Render
+# Configurações
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 TZ = "America/Sao_Paulo"
 
-# Log para verificar se a chave foi lida (vai aparecer nos logs da Render)
-if not GEMINI_KEY:
-    print("⚠️ AVISO: GEMINI_API_KEY não encontrada nas variáveis de ambiente!")
-
-# Memória e Configuração IA
 MEMORY = {"last_event": None}
 genai.configure(api_key=GEMINI_KEY)
 
@@ -105,15 +100,20 @@ async def ask_lumi(user_input, context_list):
     REGRAS:
     - Retorne APENAS JSON.
     - Se for conversa normal, use acao "chat".
-    - No update/delete, use o "index" da lista.
     - JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
     """
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
-        response = model.generate_content([prompt, user_input])
+        # ALTERADO: Usando o identificador estável 'gemini-1.5-flash'
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Configuração de resposta JSON movida para a geração para evitar erros de versão
+        response = model.generate_content(
+            [prompt, user_input],
+            generation_config=genai.GenerationConfig(response_mime_type="application/json")
+        )
         return response.text
     except Exception as e:
-        print(f"❌ ERRO TÉCNICO NO GEMINI: {str(e)}")
+        print(f"ERRO TÉCNICO NO GEMINI: {str(e)}")
         return json.dumps({"acao": "chat", "msg": "Tive um problema na conexão. Pode repetir?"})
 
 # ---------------- TELEGRAM ----------------
