@@ -32,8 +32,11 @@ def create_ev(titulo, data_iso):
     service = get_calendar()
     if not service: return None
     try:
-        # Força o uso do ano correto se a IA mandar sem ano
-        start = arrow.get(data_iso).replace(year=2026).to(TZ)
+        # AJUSTE DE FUSO HORÁRIO:
+        # Interpretamos a data da IA como 'Local' e garantimos o ano de 2026
+        # O replace(tzinfo=TZ) evita que o sistema subtraia 3 horas indevidamente
+        start = arrow.get(data_iso).replace(year=2026, tzinfo=TZ)
+        
         event = {
             'summary': titulo,
             'start': {'dateTime': start.isoformat(), 'timeZone': TZ},
@@ -51,7 +54,9 @@ def update_ev(eid, nova_data):
     if not service or not eid: return None
     try:
         event = service.events().get(calendarId='primary', eventId=eid).execute()
-        start = arrow.get(nova_data).replace(year=2026).to(TZ)
+        # Aplica a mesma lógica de fuso horário no update
+        start = arrow.get(nova_data).replace(year=2026, tzinfo=TZ)
+        
         event['start'] = {'dateTime': start.isoformat(), 'timeZone': TZ}
         event['end'] = {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ}
         res = service.events().update(calendarId='primary', eventId=eid, body=event).execute()
@@ -67,9 +72,7 @@ def delete_ev(eid):
     try:
         service.events().delete(calendarId='primary', eventId=eid).execute()
         return True
-    except Exception as e:
-        print(f"❌ ERRO DELETE: {e}")
-        return False
+    except: return False
 
 def list_evs():
     service = get_calendar()
@@ -85,18 +88,17 @@ def list_evs():
         ).execute().get('items', [])
     except: return []
 
-# ---------------- AI ENGINE (COM TRAVA DE ANO) ----------------
+# ---------------- AI ENGINE ----------------
 async def ask_lumi(user_input, context_list):
     agora = arrow.now(TZ)
-    ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
+    ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
 
-    # Prompt reforçando o ano de 2026
     system = f"""
     Nome: Lumi. Assistente do Kauan.
-    Data de Hoje: {agora.format('DD/MM/YYYY')} (Domingo). ANO ATUAL: 2026.
+    Data de Hoje: {agora.format('DD/MM/YYYY')} ({agora.format('dddd')}). ANO ATUAL: 2026.
     Agenda Atual:
     {ctx}
-    REGRAS: Retorne JSON. Sempre use o ano de 2026 para novas datas.
+    REGRAS: Retorne JSON. Sempre use o ano de 2026.
     JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
     """
     try:
@@ -122,7 +124,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = json.loads(raw)
         acao = data.get("acao")
-        msg = data.get("msg", "") # Começa vazio para validação
+        msg = data.get("msg", "")
 
         if acao == "create":
             ev = create_ev(data["titulo"], data["data"])
@@ -136,32 +138,21 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif acao == "delete":
             idx = data.get("index")
-            # Se deletar o que acabou de criar
-            eid = None
-            if idx is not None and idx < len(eventos):
-                eid = eventos[idx]["id"]
-            elif MEMORY["last_event"]:
-                eid = MEMORY["last_event"]["id"]
-
+            eid = eventos[idx]["id"] if (idx is not None and idx < len(eventos)) else (MEMORY["last_event"]["id"] if MEMORY["last_event"] else None)
             if eid and delete_ev(eid):
                 msg = "🗑️ Evento removido com sucesso!"
                 MEMORY["last_event"] = None
-            else:
-                msg = "Não consegui encontrar ou apagar esse evento."
+            else: msg = "Não consegui apagar o evento."
 
-        elif acao == "read":
+        elif acao == "read" or not msg:
             if not eventos: msg = "Sua agenda está vazia!"
             else:
                 linhas = [f"📅 {arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')} - {e.get('summary')}" for e in eventos]
                 msg = "📋 *Sua Agenda:*\n\n" + "\n".join(linhas)
-        
-        # Se msg ainda estiver vazia, define um padrão para evitar erro do Telegram
-        if not msg:
-            msg = data.get("msg", "Entendido!")
 
         await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
     except Exception as e:
-        await update.message.reply_text(f"Erro no processamento: {str(e)}")
+        await update.message.reply_text(f"Erro: {str(e)}")
 
 # ---------------- INFRA ----------------
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
