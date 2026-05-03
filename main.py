@@ -10,7 +10,6 @@ from googleapiclient.discovery import build
 load_dotenv()
 
 # --- CONFIGURAÇÕES ---
-# Certifique-se de que a variável na Render agora é a da Groq
 API_KEY = os.getenv("GROQ_API_KEY") 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
@@ -18,16 +17,24 @@ TZ = "America/Sao_Paulo"
 
 MEMORY = {"last_event": None}
 
-# ---------------- CALENDAR ENGINE ----------------
+# ---------------- CALENDAR ENGINE (COM LOGS DE DEBUG) ----------------
 def get_calendar():
     try:
-        creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
+        token_data = os.getenv("GOOGLE_TOKEN")
+        if not token_data:
+            print("❌ ERRO: Variável GOOGLE_TOKEN não encontrada na Render.")
+            return None
+        creds = Credentials.from_authorized_user_info(json.loads(token_data))
         return build('calendar', 'v3', credentials=creds)
-    except: return None
+    except Exception as e:
+        print(f"❌ ERRO NA AUTENTICAÇÃO DO GOOGLE: {str(e)}")
+        return None
 
 def create_ev(titulo, data_iso):
     service = get_calendar()
-    if not service: return None
+    if not service: 
+        print("❌ ERRO: Service do Calendar não foi iniciado.")
+        return None
     try:
         start = arrow.get(data_iso).to(TZ)
         event = {
@@ -36,9 +43,12 @@ def create_ev(titulo, data_iso):
             'end': {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ},
         }
         res = service.events().insert(calendarId='primary', body=event).execute()
+        print(f"✅ EVENTO CRIADO COM SUCESSO: {res.get('htmlLink')}")
         MEMORY["last_event"] = res
         return res
-    except: return None
+    except Exception as e:
+        print(f"❌ ERRO AO INSERIR NO GOOGLE: {str(e)}")
+        return None
 
 def update_ev(eid, nova_data):
     service = get_calendar()
@@ -49,17 +59,23 @@ def update_ev(eid, nova_data):
         event['start'] = {'dateTime': start.isoformat(), 'timeZone': TZ}
         event['end'] = {'dateTime': start.shift(hours=1).isoformat(), 'timeZone': TZ}
         res = service.events().update(calendarId='primary', eventId=eid, body=event).execute()
+        print(f"✅ EVENTO ATUALIZADO: {res.get('htmlLink')}")
         MEMORY["last_event"] = res
         return res
-    except: return None
+    except Exception as e:
+        print(f"❌ ERRO AO ATUALIZAR NO GOOGLE: {str(e)}")
+        return None
 
 def delete_ev(eid):
     service = get_calendar()
     if not service or not eid: return False
     try:
         service.events().delete(calendarId='primary', eventId=eid).execute()
+        print(f"✅ EVENTO DELETADO: {eid}")
         return True
-    except: return False
+    except Exception as e:
+        print(f"❌ ERRO AO DELETAR NO GOOGLE: {str(e)}")
+        return False
 
 def list_evs():
     service = get_calendar()
@@ -73,7 +89,9 @@ def list_evs():
             singleEvents=True,
             orderBy='startTime'
         ).execute().get('items', [])
-    except: return []
+    except Exception as e:
+        print(f"❌ ERRO AO LISTAR EVENTOS: {str(e)}")
+        return []
 
 # ---------------- INTENT ----------------
 def classify_intent(text):
@@ -105,17 +123,13 @@ async def ask_lumi(user_input, context_list):
                 "response_format": {"type": "json_object"}
             }, timeout=12)
         
-        # Validação da resposta para evitar o erro 'choices'
         json_res = res.json()
         if 'choices' in json_res:
             return json_res['choices'][0]['message']['content']
-        else:
-            print(f"RESPOSTA ESTRANHA DA API: {json_res}")
-            return json.dumps({"acao": "chat", "msg": "A API respondeu de um jeito inesperado."})
-            
+        return json.dumps({"acao": "chat", "msg": "Erro na resposta da API."})
     except Exception as e:
-        print(f"ERRO API: {e}")
-        return json.dumps({"acao": "chat", "msg": "Erro de conexão com a API."})
+        print(f"❌ ERRO NA API (IA): {e}")
+        return json.dumps({"acao": "chat", "msg": "Erro de conexão com a IA."})
 
 # ---------------- TELEGRAM ----------------
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,11 +156,10 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if acao == "create":
             ev = create_ev(data["titulo"], data["data"])
-            msg = f"✅ *{ev['summary']}* criado!\n🔗 [Ver no Google]({ev['htmlLink']})" if ev else "Erro ao criar ❌"
+            msg = f"✅ *{ev['summary']}* criado!\n🔗 [Ver no Google]({ev['htmlLink']})" if ev else "Erro ao criar no Google ❌"
 
         elif acao == "update":
             idx = data.get("index")
-            # Se a IA não der o index, tenta usar a memória do último evento criado
             eid = eventos[idx]["id"] if (idx is not None and idx < len(eventos)) else (MEMORY["last_event"]["id"] if MEMORY["last_event"] else None)
             res = update_ev(eid, data["data"])
             msg = f"🕒 Horário atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento 🤔"
@@ -154,7 +167,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif acao == "delete":
             idx = data.get("index")
             if idx is not None and idx < len(eventos):
-                msg = "🗑️ Removido!\n🔗 [Abrir Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ❌"
+                msg = "🗑️ Removido!\n🔗 [Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ao deletar ❌"
             else: msg = "Qual evento devo apagar? 🤔"
 
         await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
