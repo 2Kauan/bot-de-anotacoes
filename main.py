@@ -1,4 +1,5 @@
 import os, json, arrow, requests
+import google.generativeai as genai
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -9,13 +10,15 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-GROQ_KEY = os.getenv("GROQ_API_KEY")
+# Configurações
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
-
 TZ = "America/Sao_Paulo"
 
+# Memória e Configuração IA
 MEMORY = {"last_event": None}
+genai.configure(api_key=GEMINI_KEY)
 
 # ---------------- CALENDAR ----------------
 def get_calendar():
@@ -78,28 +81,35 @@ def list_evs():
 def classify_intent(text):
     t = text.lower()
     if any(p in t for p in ["tem", "existe", "tenho", "lista", "agenda", "mostrar"]): return "read"
-    if any(p in t for p in ["apaga", "remove", "deleta"]): return "delete"
-    if any(p in t for p in ["muda", "altera", "coloca", "remarca"]): return "update"
-    if any(p in t for p in ["cria", "lembrete", "marcar", "agendar"]): return "create"
+    if any(p in t for p in ["apaga", "remove", "deleta", "excluir"]): return "delete"
+    if any(p in t for p in ["muda", "altera", "coloca", "remarca", "ajusta"]): return "update"
+    if any(p in t for p in ["cria", "lembrete", "marcar", "agendar", "novo"]): return "create"
     return "unknown"
 
-# ---------------- AI ----------------
+# ---------------- AI (GEMINI FLASH) ----------------
 async def ask_lumi(user_input, context_list):
     agora = arrow.now(TZ)
     ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
 
-    system = f"Seu nome é Lumi, uma assistente de agenda conectada ao google Calendar.\nAgora: {agora.format('DD/MM HH:mm')}\nEventos:\n{ctx}\nREGRAS: Retorne apenas JSON."
+    prompt = f"""
+    Seu nome é Lumi, assistente do Kauan. Local: Jaicós/PI.
+    Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
+    
+    Agenda Atual:
+    {ctx}
+
+    REGRAS:
+    - Retorne APENAS JSON.
+    - Se for conversa normal, use acao "chat".
+    - No update/delete, use o "index" da lista.
+    - JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
+    """
     try:
-        res = requests.post("https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_input}],
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2
-            }, timeout=12)
-        return res.json()['choices'][0]['message']['content']
-    except: return json.dumps({"acao": "chat", "msg": "Erro na IA 😕"})
+        model = genai.GenerativeModel('gemini-1.5-flash', generation_config={"response_mime_type": "application/json"})
+        response = model.generate_content([prompt, user_input])
+        return response.text
+    except:
+        return json.dumps({"acao": "chat", "msg": "Tive um problema na conexão. Pode repetir?"})
 
 # ---------------- TELEGRAM ----------------
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,9 +121,10 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = classify_intent(text)
     eventos = list_evs()
 
+    # Atalho rápido para leitura sem IA
     if intent == "read":
         if not eventos:
-            await update.message.reply_text("Agenda vazia")
+            await update.message.reply_text("Sua agenda está vazia!")
             return
         linhas = [f"📅 {arrow.get(e['start'].get('dateTime')).to(TZ).format('DD/MM HH:mm')} - {e.get('summary')}" for e in eventos]
         await update.message.reply_text("📋 *Sua Agenda:*\n\n" + "\n".join(linhas), parse_mode='Markdown')
@@ -123,7 +134,7 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = json.loads(raw)
         acao = data.get("acao")
-        msg = "🤖"
+        msg = data.get("msg", "Como posso ajudar?")
 
         if acao == "create":
             ev = create_ev(data["titulo"], data["data"])
@@ -132,21 +143,18 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif acao == "update":
             idx = data.get("index")
             eid = eventos[idx]["id"] if (idx is not None and idx < len(eventos)) else (MEMORY["last_event"]["id"] if MEMORY["last_event"] else None)
-            
             res = update_ev(eid, data["data"])
-            msg = f"🕒 Atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Evento não encontrado 🤔"
+            msg = f"🕒 Horário atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento. 🤔"
 
         elif acao == "delete":
             idx = data.get("index")
             if idx is not None and idx < len(eventos):
-                msg = "🗑️ Removido!\n🔗 [Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ❌"
-            else: msg = "Qual evento? 🤔"
-
-        else: msg = data.get("msg", "🤖")
+                msg = "🗑️ Removido!\n🔗 [Ver Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ❌"
+            else: msg = "Qual evento devo apagar? 🤔"
 
         await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
     except Exception as e:
-        await update.message.reply_text(f"Erro: {str(e)}")
+        await update.message.reply_text(f"Me confundi um pouco: {str(e)}")
 
 # ---------------- INFRA ----------------
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -159,9 +167,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-async def root(): return {"status": "online"}
+async def root(): return {"status": "Lumi Online"}
 
-@app.post("/webhook{full_path:path}") # A "VACINA" CONTRA ERROS DE ROTA
+@app.post("/webhook{full_path:path}")
 async def webhook(request: Request, full_path: str = ""):
     try:
         data = await request.json()
