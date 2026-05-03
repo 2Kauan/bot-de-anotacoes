@@ -1,5 +1,4 @@
 import os, json, arrow, requests
-import google.generativeai as genai
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -10,16 +9,15 @@ from googleapiclient.discovery import build
 
 load_dotenv()
 
-# Configurações
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+# --- CONFIGURAÇÕES ---
+API_KEY = os.getenv("GEMINI_API_KEY") # Ou GROQ_API_KEY se você trocou
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MEU_ID_TELEGRAM = int(os.getenv("MEU_ID_TELEGRAM", 0))
 TZ = "America/Sao_Paulo"
 
 MEMORY = {"last_event": None}
-genai.configure(api_key=GEMINI_KEY)
 
-# ---------------- CALENDAR ----------------
+# ---------------- CALENDAR ENGINE ----------------
 def get_calendar():
     try:
         creds = Credentials.from_authorized_user_info(json.loads(os.getenv("GOOGLE_TOKEN")))
@@ -85,47 +83,42 @@ def classify_intent(text):
     if any(p in t for p in ["cria", "lembrete", "marcar", "agendar", "novo"]): return "create"
     return "unknown"
 
-# ---------------- AI (GEMINI FLASH) ----------------
+# ---------------- AI ENGINE ----------------
 async def ask_lumi(user_input, context_list):
     agora = arrow.now(TZ)
     ctx = "\n".join([f"{i} - {arrow.get(e['start'].get('dateTime')).format('DD/MM HH:mm')} - {e.get('summary')}" for i, e in enumerate(context_list)])
 
-    prompt = f"""
-    Seu nome é Lumi, assistente do Kauan.
-    Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')})
-    
-    Agenda Atual:
-    {ctx}
-
-    REGRAS:
-    - Retorne APENAS JSON.
-    - Se for conversa normal, use acao "chat".
-    - JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
+    system = f"""
+    Nome: Lumi. Papel: Assistente de Agenda do Kauan.
+    Agora: {agora.format('DD/MM HH:mm')} ({agora.format('dddd')}).
+    Agenda: {ctx}
+    REGRAS: Retorne APENAS JSON.
+    JSON: {{"acao":"create|update|delete|read|chat", "titulo":"...", "data":"ISO", "index":0, "msg":"..."}}
     """
     try:
-        # ALTERADO: Usando o identificador estável 'gemini-1.5-flash'
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        # Configuração de resposta JSON movida para a geração para evitar erros de versão
-        response = model.generate_content(
-            [prompt, user_input],
-            generation_config=genai.GenerationConfig(response_mime_type="application/json")
-        )
-        return response.text
+        # Se você trocou para Groq, mude a URL e o header conforme o código anterior
+        res = requests.post("https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_input}],
+                "response_format": {"type": "json_object"}
+            }, timeout=12)
+        return res.json()['choices'][0]['message']['content']
     except Exception as e:
-        print(f"ERRO TÉCNICO NO GEMINI: {str(e)}")
-        return json.dumps({"acao": "chat", "msg": "Tive um problema na conexão. Pode repetir?"})
+        print(f"ERRO API: {e}")
+        return json.dumps({"acao": "chat", "msg": "Tive um erro de conexão com a API."})
 
 # ---------------- TELEGRAM ----------------
 async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or update.effective_user.id != MEU_ID_TELEGRAM: return
     
-    text = update.message.text
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-
-    intent = classify_intent(text)
+    
+    intent = classify_intent(update.message.text)
     eventos = list_evs()
 
+    # Se for apenas leitura, resolvemos sem IA para ser mais rápido
     if intent == "read":
         if not eventos:
             await update.message.reply_text("Sua agenda está vazia!")
@@ -134,7 +127,8 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📋 *Sua Agenda:*\n\n" + "\n".join(linhas), parse_mode='Markdown')
         return
 
-    raw = await ask_lumi(text, eventos)
+    # Para outras ações, usamos a IA
+    raw = await ask_lumi(update.message.text, eventos)
     try:
         data = json.loads(raw)
         acao = data.get("acao")
@@ -148,17 +142,17 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = data.get("index")
             eid = eventos[idx]["id"] if (idx is not None and idx < len(eventos)) else (MEMORY["last_event"]["id"] if MEMORY["last_event"] else None)
             res = update_ev(eid, data["data"])
-            msg = f"🕒 Horário atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento. 🤔"
+            msg = f"🕒 Horário atualizado!\n🔗 [Conferir]({res['htmlLink']})" if res else "Não achei o evento 🤔"
 
         elif acao == "delete":
             idx = data.get("index")
             if idx is not None and idx < len(eventos):
-                msg = "🗑️ Removido!\n🔗 [Ver Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ❌"
+                msg = "🗑️ Removido!\n🔗 [Agenda](https://calendar.google.com/)" if delete_ev(eventos[idx]["id"]) else "Erro ❌"
             else: msg = "Qual evento devo apagar? 🤔"
 
         await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=False)
     except Exception as e:
-        await update.message.reply_text(f"Me confundi um pouco: {str(e)}")
+        await update.message.reply_text(f"Erro no processamento: {str(e)}")
 
 # ---------------- INFRA ----------------
 bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
